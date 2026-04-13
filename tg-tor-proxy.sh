@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.5"
+readonly VERSION="2.2.6"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1373,7 +1373,7 @@ cmd_diagnose() {
         pct=$(tor_bootstrap_pct_inst 0 2>/dev/null || echo "0")
         if $all_ready; then
             # Показываем exit IP для каждого инстанса
-            for ((i=0; i<tor_count; i++)); do
+            for ((i=0; i<tor_instances; i++)); do
                 local tor_ip
                 tor_ip=$(curl -s --connect-timeout 10 \
                     --socks5-hostname "127.0.0.1:${TOR_PORTS[$i]}" \
