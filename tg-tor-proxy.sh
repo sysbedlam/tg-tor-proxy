@@ -871,12 +871,23 @@ echo "Bootstrap timeout"; exit 1
 BSEOF
     chmod +x "$BOOTSTRAP_SCRIPT"
 
-    # Routes service
+    # Routes service — dependency varies by single vs multi-instance
+    local tor_count_now
+    tor_count_now=$(get_tor_instances)
+    local routes_after routes_wants
+    if [ "$tor_count_now" -gt 1 ]; then
+        routes_after="network.target tg-tor-inst0.service"
+        routes_wants="tg-tor-inst0.service"
+    else
+        routes_after="network.target redsocks.service"
+        routes_wants="redsocks.service"
+    fi
+
     cat > /etc/systemd/system/tg-tor-routes.service << EOF
 [Unit]
 Description=Telegram → Tor iptables routes
-After=network.target redsocks.service
-Requires=redsocks.service
+After=${routes_after}
+Wants=${routes_wants}
 
 [Service]
 Type=oneshot
@@ -967,11 +978,19 @@ WDEOF
     chmod +x /usr/local/bin/tg-tor-watchdog.sh
 
     # Watchdog service
+    local wd_after wd_wants
+    if [ "$tor_count_now" -gt 1 ]; then
+        wd_after="tg-tor-inst0.service"
+        wd_wants="tg-tor-inst0.service"
+    else
+        wd_after="tor@default.service redsocks.service"
+        wd_wants="tor@default.service"
+    fi
     cat > /etc/systemd/system/tg-tor-watchdog.service << EOF
 [Unit]
 Description=Tor + Redsocks stability watchdog for tg-tor-proxy
-After=tor@default.service redsocks.service
-Wants=tor@default.service
+After=${wd_after}
+Wants=${wd_wants}
 
 [Service]
 Type=simple
