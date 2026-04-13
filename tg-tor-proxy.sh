@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.4"
+readonly VERSION="2.2.5"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -917,32 +917,11 @@ echo "Bootstrap timeout"; exit 1
 BSEOF
     chmod +x "$BOOTSTRAP_SCRIPT"
 
-    # Routes service — dependency varies by single vs multi-instance
-    local tor_count_now="$tor_count_arg"
-    local routes_after routes_wants
-    if [ "$tor_count_now" -gt 1 ]; then
-        routes_after="network.target tg-tor-inst0.service"
-        routes_wants="tg-tor-inst0.service"
-    else
-        routes_after="network.target redsocks.service"
-        routes_wants="redsocks.service"
-    fi
-
-    cat > /etc/systemd/system/tg-tor-routes.service << EOF
-[Unit]
-Description=Telegram → Tor iptables routes
-After=${routes_after}
-Wants=${routes_wants}
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=$ROUTES_SCRIPT start
-ExecStop=$ROUTES_SCRIPT stop
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    # tg-tor-routes.service не нужен — iptables правила сохраняются через netfilter-persistent
+    # Удаляем если остался от старой версии
+    systemctl disable tg-tor-routes 2>/dev/null || true
+    systemctl stop tg-tor-routes 2>/dev/null || true
+    rm -f /etc/systemd/system/tg-tor-routes.service
 
     # Bootstrap watcher service
     cat > /etc/systemd/system/tg-tor-bootstrap.service << EOF
@@ -967,13 +946,13 @@ EOF
 [Unit]
 Description=Telegram-through-Tor proxy for VPN clients
 After=tg-tor-bootstrap.service redsocks.service
-Wants=tg-tor-bootstrap.service redsocks.service tg-tor-routes.service
+Wants=tg-tor-bootstrap.service redsocks.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c 'systemctl start tg-tor-routes.service && echo "tg-tor-proxy active"'
-ExecStop=/bin/bash -c 'systemctl stop tg-tor-routes.service'
+ExecStart=/bin/true
+ExecStop=/bin/true
 
 [Install]
 WantedBy=multi-user.target
@@ -1066,7 +1045,7 @@ LimitNOFILE=65536
 EOF
 
     systemctl daemon-reload
-    systemctl enable redsocks tg-tor-routes tg-tor-bootstrap tg-tor-proxy tg-tor-watchdog 2>/dev/null || true
+    systemctl enable redsocks tg-tor-bootstrap tg-tor-proxy tg-tor-watchdog 2>/dev/null || true
     log "Systemd services installed and enabled"
 }
 
@@ -1372,7 +1351,6 @@ cmd_diagnose() {
         print_svc_status "tor@default"
         print_svc_status "redsocks"
     fi
-    print_svc_status "tg-tor-routes"
     print_svc_status "tg-tor-watchdog"
 
     # ── Tor bootstrap ─────────────────────────────────────────────────────
@@ -2207,6 +2185,15 @@ auto_migrate() {
     if command -v netfilter-persistent &>/dev/null; then
         netfilter-persistent save &>/dev/null \
             && log "iptables правила сохранены (persistent)" || true
+    fi
+
+    # 4b. Убрать tg-tor-routes.service — заменён netfilter-persistent
+    if [ -f /etc/systemd/system/tg-tor-routes.service ]; then
+        systemctl disable tg-tor-routes 2>/dev/null || true
+        systemctl stop tg-tor-routes 2>/dev/null || true
+        rm -f /etc/systemd/system/tg-tor-routes.service
+        systemctl daemon-reload 2>/dev/null || true
+        log "tg-tor-routes.service удалён (заменён netfilter-persistent)"
     fi
 
     # 5. Обновить torrc: убрать устаревший OptimisticData, добавить CircuitStreamTimeout,
