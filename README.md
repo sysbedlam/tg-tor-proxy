@@ -15,7 +15,8 @@ VPN клиент → AWG/Xray контейнер → iptables → redsocks → T
 - 🔍 **Авто-обнаружение** контейнеров AmneziaWG, Xray, V2Ray, Sing-Box
 - 🧅 **Tor без мостов** — сначала проверяет прямое подключение
 - 🌉 **obfs4-мосты** — если Tor заблокирован провайдером (DPI)
-- 🔄 **Watchdog** — автоматически "расталкивает" зависший bootstrap через SIGHUP
+- 🔄 **Watchdog** — постоянный мониторинг: SIGHUP при зависшем bootstrap, автоперезапуск Tor и Redsocks
+- 🛡️ **Стабильность** — оптимальные настройки Tor-каналов, `Restart=always`, fd-лимиты для Redsocks
 - 🗑️ **Полное удаление** одним пунктом меню
 - 📊 **Диагностика** — полный отчёт о состоянии всей цепочки
 - 📡 **Live-мониторинг** Telegram-сессий в реальном времени
@@ -52,7 +53,7 @@ sudo tg-tor-proxy
 
 ```
 ╔══════════════════════════════════════════════╗
-║   tg-tor-proxy  v1.2.0                      ║
+║   tg-tor-proxy  v1.3.0                      ║
 ║   Telegram через Tor для VPN-клиентов        ║
 ╚══════════════════════════════════════════════╝
 
@@ -94,7 +95,11 @@ sudo tg-tor-proxy
    - Если заблокировано DPI → запрашивает obfs4-мосты
 4. Настраивает **redsocks** (`0.0.0.0:12345` → Tor SOCKS5)
 5. Создаёт цепочку **iptables** `TELEGRAM_TOR` — перенаправляет 49 подсетей Telegram
-6. Устанавливает **systemd-сервисы** с автозапуском и watchdog
+6. Устанавливает **systemd-сервисы** с автозапуском:
+   - `tg-tor-watchdog` — постоянный демон: SIGHUP при зависании, автоперезапуск при сбое
+   - `Restart=always` для Tor и Redsocks
+   - `LimitNOFILE=65536` для Redsocks (защита от fd-исчерпания)
+   - Параметры Tor: `NumEntryGuards`, `NewCircuitPeriod`, `MaxClientCircuitsPending`
 
 ---
 

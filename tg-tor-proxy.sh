@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 1.2.0
+# Version: 1.3.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -266,6 +266,14 @@ configure_tor_direct() {
 ## Managed by tg-tor-proxy
 SocksPort 9050
 Log notice syslog
+# Circuit stability
+CircuitBuildTimeout 60
+LearnCircuitBuildTimeout 0
+MaxCircuitDirtiness 600
+NumEntryGuards 4
+NewCircuitPeriod 15
+MaxClientCircuitsPending 128
+KeepalivePeriod 30
 TOREOF
     systemctl restart tor@default 2>/dev/null || systemctl restart tor
 }
@@ -300,6 +308,14 @@ configure_tor_bridges() {
                 echo "Bridge $line"
             fi
         done
+        echo "# Circuit stability"
+        echo "CircuitBuildTimeout 60"
+        echo "LearnCircuitBuildTimeout 0"
+        echo "MaxCircuitDirtiness 600"
+        echo "NumEntryGuards 4"
+        echo "NewCircuitPeriod 15"
+        echo "MaxClientCircuitsPending 128"
+        echo "KeepalivePeriod 30"
     } > "$TORRC"
 
     systemctl restart tor@default 2>/dev/null || systemctl restart tor
@@ -695,8 +711,104 @@ ExecStop=/bin/bash -c 'systemctl stop tg-tor-routes.service'
 WantedBy=multi-user.target
 EOF
 
+    # Persistent watchdog script
+    cat > /usr/local/bin/tg-tor-watchdog.sh << 'WDEOF'
+#!/bin/bash
+# Persistent watchdog for tg-tor-proxy — restarts Tor/redsocks if they fail
+COOKIE="/run/tor/control.authcookie"
+CONTROL="/run/tor/control"
+LOG_TAG="tg-tor-watchdog"
+log() { logger -t "$LOG_TAG" "$*"; echo "$(date '+%H:%M:%S') $*"; }
+
+get_pct() {
+    python3 -c "
+import socket, re
+try:
+    with open('$COOKIE','rb') as f: c=f.read().hex()
+    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+    s.settimeout(3); s.connect('$CONTROL')
+    s.send(f'AUTHENTICATE {c}\r\n'.encode()); s.recv(200)
+    s.send(b'GETINFO status/bootstrap-phase\r\n')
+    r=s.recv(500).decode(); s.close()
+    m=re.search(r'PROGRESS=(\d+)',r); print(m.group(1) if m else '-1')
+except: print('-1')
+" 2>/dev/null || echo -1
+}
+
+sighup_tor() {
+    local pid
+    pid=$(systemctl show tor@default --property=MainPID --value 2>/dev/null || echo 0)
+    [ "$pid" != "0" ] && kill -HUP "$pid" 2>/dev/null && \
+        log "SIGHUP sent to Tor (PID $pid) — pausing 15s" && sleep 15
+}
+
+STUCK=0; LAST=-1; TICKS100=0; FAILS=0
+log "Watchdog started"
+while true; do
+    sleep 10
+    pct=$(get_pct)
+    if [ "$pct" -eq -1 ]; then
+        FAILS=$((FAILS+1))
+        [ $FAILS -ge 3 ] && ! systemctl is-active --quiet tor@default && \
+            log "Tor down — restarting..." && systemctl restart tor@default && sleep 20 && FAILS=0 LAST=-1 STUCK=0
+        continue
+    fi
+    FAILS=0
+    if [ "$pct" -eq 100 ]; then
+        TICKS100=$((TICKS100+1)); STUCK=0; LAST=100
+        ! systemctl is-active --quiet redsocks && \
+            log "Redsocks down — restarting..." && systemctl restart redsocks
+        journalctl -u redsocks --since "30 seconds ago" --no-pager -q 2>/dev/null | grep -q "backing off" && \
+            log "Redsocks fd exhaustion — restarting..." && systemctl restart redsocks
+        [ $((TICKS100 % 60)) -eq 0 ] && [ $TICKS100 -gt 0 ] && \
+            log "Periodic circuit refresh" && sighup_tor
+    else
+        log "Tor bootstrap: ${pct}%"; TICKS100=0
+        [ "$pct" -eq "$LAST" ] && STUCK=$((STUCK+1)) || { STUCK=0; LAST=$pct; }
+        [ $STUCK -eq 3 ] && { log "Stuck at ${pct}% for 30s — SIGHUP"; sighup_tor; STUCK=0; }
+        [ $STUCK -ge 12 ] && { log "Stuck $((STUCK*10))s — restarting Tor"; systemctl restart tor@default; sleep 20; STUCK=0; LAST=-1; }
+    fi
+done
+WDEOF
+    chmod +x /usr/local/bin/tg-tor-watchdog.sh
+
+    # Watchdog service
+    cat > /etc/systemd/system/tg-tor-watchdog.service << EOF
+[Unit]
+Description=Tor + Redsocks stability watchdog for tg-tor-proxy
+After=tor@default.service redsocks.service
+Wants=tor@default.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tg-tor-watchdog.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Systemd drop-ins for auto-restart
+    mkdir -p /etc/systemd/system/tor@default.service.d
+    cat > /etc/systemd/system/tor@default.service.d/restart.conf << EOF
+[Service]
+Restart=always
+RestartSec=10
+EOF
+
+    mkdir -p /etc/systemd/system/redsocks.service.d
+    cat > /etc/systemd/system/redsocks.service.d/limits.conf << EOF
+[Service]
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+EOF
+
     systemctl daemon-reload
-    systemctl enable redsocks tg-tor-routes tg-tor-bootstrap tg-tor-proxy 2>/dev/null || true
+    systemctl enable redsocks tg-tor-routes tg-tor-bootstrap tg-tor-proxy tg-tor-watchdog 2>/dev/null || true
     log "Systemd services installed and enabled"
 }
 
@@ -827,11 +939,16 @@ cmd_remove() {
     [[ "${confirm^^}" != "Y" ]] && { info "Cancelled."; exit 0; }
 
     # Stop and disable services
-    for svc in tg-tor-proxy tg-tor-routes tg-tor-bootstrap; do
+    for svc in tg-tor-proxy tg-tor-routes tg-tor-bootstrap tg-tor-watchdog; do
         systemctl stop "$svc"  2>/dev/null || true
         systemctl disable "$svc" 2>/dev/null || true
         rm -f "/etc/systemd/system/${svc}.service"
     done
+    # Remove systemd drop-ins
+    rm -rf /etc/systemd/system/tor@default.service.d
+    rm -rf /etc/systemd/system/redsocks.service.d
+    # Remove watchdog script
+    rm -f /usr/local/bin/tg-tor-watchdog.sh
     systemctl daemon-reload 2>/dev/null || true
 
     # Flush iptables
