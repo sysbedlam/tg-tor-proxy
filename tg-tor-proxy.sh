@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 1.3.0
+# Version: 1.4.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="1.3.0"
+readonly VERSION="1.4.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1226,6 +1226,65 @@ cmd_add_bridges_file() {
 # ─────────────────────────────────────────────────────────────────────────────
 # CHECK TOR ONLY
 # ─────────────────────────────────────────────────────────────────────────────
+cmd_update() {
+    require_root
+
+    local raw_base="https://raw.githubusercontent.com/sysbedlam/tg-tor-proxy/main"
+    local script_url="$raw_base/tg-tor-proxy.sh"
+    local watchdog_url="$raw_base/tg-tor-watchdog.sh"
+
+    hdr "Проверка обновлений"
+
+    # Get remote version
+    local remote_version
+    remote_version=$(curl -fsSL --connect-timeout 10 "$script_url" 2>/dev/null \
+        | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"')
+
+    if [ -z "$remote_version" ]; then
+        err "Не удалось получить версию с GitHub. Проверьте интернет-соединение."
+        return 1
+    fi
+
+    echo -e "  Текущая версия:  ${BOLD}v${VERSION}${NC}"
+    echo -e "  Версия GitHub:   ${BOLD}v${remote_version}${NC}"
+    echo ""
+
+    if [ "$remote_version" = "$VERSION" ]; then
+        log "Уже установлена последняя версия."
+        return 0
+    fi
+
+    echo -e "  ${GREEN}Доступно обновление: v${VERSION} → v${remote_version}${NC}"
+    echo ""
+    read -rp "  Обновить? [Y/n]: " confirm
+    [[ "${confirm,,}" == "n" ]] && { info "Отменено."; return 0; }
+
+    echo ""
+    info "Скачиваю tg-tor-proxy v${remote_version}..."
+    if curl -fsSL --connect-timeout 15 "$script_url" -o /usr/local/bin/tg-tor-proxy.new; then
+        chmod +x /usr/local/bin/tg-tor-proxy.new
+        mv /usr/local/bin/tg-tor-proxy.new /usr/local/bin/tg-tor-proxy
+        log "Основной скрипт обновлён"
+    else
+        err "Ошибка при скачивании скрипта"
+        return 1
+    fi
+
+    info "Скачиваю watchdog..."
+    if curl -fsSL --connect-timeout 15 "$watchdog_url" -o /usr/local/bin/tg-tor-watchdog.sh.new; then
+        chmod +x /usr/local/bin/tg-tor-watchdog.sh.new
+        mv /usr/local/bin/tg-tor-watchdog.sh.new /usr/local/bin/tg-tor-watchdog.sh
+        systemctl restart tg-tor-watchdog 2>/dev/null || true
+        log "Watchdog обновлён и перезапущен"
+    else
+        warn "Не удалось обновить watchdog (основной скрипт обновлён)"
+    fi
+
+    echo ""
+    log "Обновление завершено: v${VERSION} → v${remote_version}"
+    info "Перезапустите tg-tor-proxy для применения изменений"
+}
+
 cmd_check_tor() {
     require_root
     hdr "Checking Tor connectivity"
@@ -1359,6 +1418,7 @@ show_menu() {
     echo -e "  ${CYAN}5)${NC}  Загрузить мосты из файла"
     echo -e "  ${CYAN}6)${NC}  Применить iptables правила (если слетели)"
     echo -e "  ${CYAN}7)${NC}  Показать активные Telegram-сессии (live)"
+    echo -e "  ${CYAN}9)${NC}  Проверить и установить обновление"
     echo -e "  ${RED}8)${NC}  Удалить всё (deinstall)"
     echo -e "  ${CYAN}0)${NC}  Выход"
     echo ""
@@ -1369,7 +1429,7 @@ interactive_menu() {
 
     while true; do
         show_menu
-        read -rp "  Ваш выбор [0-8]: " choice
+        read -rp "  Ваш выбор [0-9]: " choice
         echo ""
 
         case "$choice" in
@@ -1446,6 +1506,11 @@ interactive_menu() {
                 echo ""
                 read -rp "  Нажмите Enter для возврата в меню..." _dummy
                 ;;
+            9)
+                cmd_update
+                echo ""
+                read -rp "  Нажмите Enter для возврата в меню..." _dummy
+                ;;
             8)
                 cmd_remove
                 echo ""
@@ -1502,6 +1567,9 @@ main() {
             require_root
             [ -x "$ROUTES_SCRIPT" ] || die "Скрипт правил не найден. Запустите установку."
             bash "$ROUTES_SCRIPT" stop 2>/dev/null; bash "$ROUTES_SCRIPT" start
+            ;;
+        --update|-u)
+            require_root; cmd_update
             ;;
         --help|-h|help)
             cat << EOF
