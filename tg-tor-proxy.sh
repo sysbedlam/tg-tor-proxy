@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.1"
+readonly VERSION="2.2.2"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1743,23 +1743,44 @@ cmd_update() {
 
     local remote_version release_download_url="" wd_download_url="" release_json=""
 
+    # Извлекаем API URLs ассетов (не browser_download_url — он кешируется CDN).
+    # API URL вида https://api.github.com/repos/.../releases/assets/ID
+    # при запросе с Accept: application/octet-stream отдаёт файл напрямую без CDN.
+    _parse_asset_urls() {
+        local json="$1"
+        release_download_url=$(echo "$json" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    assets=d.get('assets',[])
+    a=[x for x in assets if x['name']=='tg-tor-proxy.sh']
+    print(a[0]['url'] if a else '')
+except: print('')
+" 2>/dev/null || true)
+        wd_download_url=$(echo "$json" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+    assets=d.get('assets',[])
+    a=[x for x in assets if x['name']=='tg-tor-watchdog.sh']
+    print(a[0]['url'] if a else '')
+except: print('')
+" 2>/dev/null || true)
+    }
+
     if [ "$branch" = "main" ]; then
-        # Stable: используем /releases/latest — не кешируется CDN
+        # Stable: /releases/latest
         release_json=$(curl -fsSL --connect-timeout 10 \
             "${api_base}/releases/latest" 2>/dev/null || true)
         remote_version=$(echo "$release_json" \
             | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || true)
-        release_download_url=$(echo "$release_json" \
-            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-proxy\.sh' | head -1 || true)
-        wd_download_url=$(echo "$release_json" \
-            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-watchdog\.sh' | head -1 || true)
+        _parse_asset_urls "$release_json"
     else
-        # Testing: ищем последний pre-release через Releases API
+        # Testing: ищем последний pre-release
         local all_releases
         all_releases=$(curl -fsSL --connect-timeout 10 \
             "${api_base}/releases?per_page=10" 2>/dev/null || true)
 
-        # Пробуем python3 для парсинга prerelease объекта
         if [ -n "$all_releases" ]; then
             release_json=$(echo "$all_releases" | python3 -c "
 import json, sys
@@ -1773,26 +1794,7 @@ except: print('{}')
 
         remote_version=$(echo "$release_json" \
             | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || true)
-        release_download_url=$(echo "$release_json" \
-            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-proxy\.sh' | head -1 || true)
-        wd_download_url=$(echo "$release_json" \
-            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-watchdog\.sh' | head -1 || true)
-
-        # Фолбэк: если API не дал версию — читаем из файла в ветке (CDN)
-        if [ -z "$remote_version" ]; then
-            info "Releases API недоступен, пробую contents API..."
-            local ts; ts=$(date +%s)
-            remote_version=$(curl -fsSL --connect-timeout 10 \
-                -H "Accept: application/vnd.github.raw" \
-                "${api_base}/contents/tg-tor-proxy.sh?ref=${branch}&ts=${ts}" 2>/dev/null \
-                | grep -m1 '^readonly VERSION=' \
-                | grep -oP '"[^"]+"' | tr -d '"' || true)
-            # Конструируем URL из версии (release assets не кешируются CDN)
-            if [ -n "$remote_version" ]; then
-                release_download_url="https://github.com/${gh_repo}/releases/download/v${remote_version}/tg-tor-proxy.sh"
-                wd_download_url="https://github.com/${gh_repo}/releases/download/v${remote_version}/tg-tor-watchdog.sh"
-            fi
-        fi
+        _parse_asset_urls "$release_json"
     fi
 
     if [ -z "$remote_version" ]; then
@@ -1822,7 +1824,10 @@ except: print('{}')
     info "Скачиваю tg-tor-proxy..."
     local dl_script="${release_download_url:-}"
     [ -z "$dl_script" ] && dl_script="${raw_base}/${branch}/tg-tor-proxy.sh?${ts}"
-    if curl -fsSL --connect-timeout 15 "$dl_script" -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null; then
+    # Accept: application/octet-stream — скачиваем через GitHub API напрямую, минуя CDN-кеш
+    if curl -fsSL --connect-timeout 15 \
+            -H "Accept: application/octet-stream" \
+            "$dl_script" -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-proxy.new
         mv /usr/local/bin/tg-tor-proxy.new /usr/local/bin/tg-tor-proxy
         # Сохраняем выбранный канал
@@ -1839,7 +1844,9 @@ except: print('{}')
     info "Скачиваю watchdog..."
     local wd_dl_url="${wd_download_url:-}"
     [ -z "$wd_dl_url" ] && wd_dl_url="${raw_base}/${branch}/tg-tor-watchdog.sh?${ts}"
-    if curl -fsSL --connect-timeout 15 "$wd_dl_url" -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null; then
+    if curl -fsSL --connect-timeout 15 \
+            -H "Accept: application/octet-stream" \
+            "$wd_dl_url" -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-watchdog.sh.new
         mv /usr/local/bin/tg-tor-watchdog.sh.new /usr/local/bin/tg-tor-watchdog.sh
         systemctl restart tg-tor-watchdog 2>/dev/null || true
