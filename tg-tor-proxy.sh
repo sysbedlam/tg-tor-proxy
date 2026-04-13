@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.0"
+readonly VERSION="2.2.1"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -337,13 +337,16 @@ configure_tor_instance() {
         echo "CookieAuthFile ${run_dir}/control.authcookie"
         echo "Log notice syslog"
         echo "# Circuit stability"
-        echo "CircuitBuildTimeout 60"
+        echo "CircuitBuildTimeout 30"
         echo "LearnCircuitBuildTimeout 0"
         echo "MaxCircuitDirtiness 600"
         echo "NumEntryGuards 4"
         echo "NewCircuitPeriod 15"
         echo "MaxClientCircuitsPending 128"
         echo "KeepalivePeriod 30"
+        echo "# Latency optimizations"
+        echo "OptimisticData 1"
+        echo "CircuitStreamTimeout 15"
         if [ "$mode" = "bridges" ] && [ -f "$bridges_file" ]; then
             grep -q "^Bridge obfs4" "$bridges_file" && \
                 echo "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy"
@@ -438,13 +441,16 @@ configure_tor_direct() {
 SocksPort 9050
 Log notice syslog
 # Circuit stability
-CircuitBuildTimeout 60
+CircuitBuildTimeout 30
 LearnCircuitBuildTimeout 0
 MaxCircuitDirtiness 600
 NumEntryGuards 4
 NewCircuitPeriod 15
 MaxClientCircuitsPending 128
 KeepalivePeriod 30
+# Latency optimizations
+OptimisticData 1
+CircuitStreamTimeout 15
 TOREOF
     systemctl restart tor@default 2>/dev/null || systemctl restart tor
 }
@@ -480,13 +486,16 @@ configure_tor_bridges() {
             fi
         done
         echo "# Circuit stability"
-        echo "CircuitBuildTimeout 60"
+        echo "CircuitBuildTimeout 30"
         echo "LearnCircuitBuildTimeout 0"
         echo "MaxCircuitDirtiness 600"
         echo "NumEntryGuards 4"
         echo "NewCircuitPeriod 15"
         echo "MaxClientCircuitsPending 128"
         echo "KeepalivePeriod 30"
+        echo "# Latency optimizations"
+        echo "OptimisticData 1"
+        echo "CircuitStreamTimeout 15"
     } > "$TORRC"
 
     systemctl restart tor@default 2>/dev/null || systemctl restart tor
@@ -2158,7 +2167,37 @@ auto_migrate() {
             && log "iptables правила сохранены (persistent)" || true
     fi
 
-    # 5. Перезапустить watchdog чтобы подхватил новый скрипт
+    # 5. Добавить OptimisticData + CircuitStreamTimeout в torrc если отсутствуют
+    #    и снизить CircuitBuildTimeout с 60 до 30
+    local tor_changed=false
+    for torrc_f in "$TORRC" /etc/tor/torrc.inst*; do
+        [ -f "$torrc_f" ] || continue
+        local changed_f=false
+        if ! grep -q 'OptimisticData' "$torrc_f"; then
+            echo "OptimisticData 1" >> "$torrc_f"
+            changed_f=true
+        fi
+        if ! grep -q 'CircuitStreamTimeout' "$torrc_f"; then
+            echo "CircuitStreamTimeout 15" >> "$torrc_f"
+            changed_f=true
+        fi
+        # Снижаем CircuitBuildTimeout с 60 до 30
+        if grep -q 'CircuitBuildTimeout 60' "$torrc_f"; then
+            sed -i 's/CircuitBuildTimeout 60/CircuitBuildTimeout 30/' "$torrc_f"
+            changed_f=true
+        fi
+        $changed_f && tor_changed=true
+    done
+    if $tor_changed; then
+        log "Tor: применены оптимизации латентности (OptimisticData, CircuitStreamTimeout)"
+        systemctl reload-or-restart tor@default 2>/dev/null || true
+        for i in 0 1 2; do
+            systemctl is-active --quiet "tg-tor-inst${i}" 2>/dev/null && \
+                systemctl reload-or-restart "tg-tor-inst${i}" 2>/dev/null || true
+        done
+    fi
+
+    # 6. Перезапустить watchdog чтобы подхватил новый скрипт
     if systemctl is-active --quiet tg-tor-watchdog; then
         systemctl restart tg-tor-watchdog 2>/dev/null \
             && log "Watchdog перезапущен" || true
