@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.0.1
+# Version: 2.1.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.0.1"
+readonly VERSION="2.1.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -31,6 +31,9 @@ readonly REDSOCKS_PORT=12345
 readonly TOR_PORT=9050
 readonly TOR_CONTROL_SOCK="/run/tor/control"
 readonly TOR_COOKIE="/run/tor/control.authcookie"
+# Multi-tor ports: inst0=9050/12345, inst1=9052/12346, inst2=9053/12347
+readonly TOR_PORTS=(9050 9052 9053)
+readonly RS_PORTS=(12345 12346 12347)
 readonly DIRECT_BOOTSTRAP_TIMEOUT=120   # seconds to wait for Tor without bridges
 readonly DIRECT_STUCK_THRESHOLD=60      # seconds at same % → switch to bridge mode
 readonly BRIDGE_BOOTSTRAP_TIMEOUT=300   # seconds to wait for Tor with bridges
@@ -113,6 +116,31 @@ tor_bootstrap_pct() {
     local resp
     resp=$(tor_query "GETINFO status/bootstrap-phase" 2>/dev/null) || true
     echo "$resp" | grep -oP 'PROGRESS=\K\d+' || echo "0"
+}
+
+# Bootstrap % for a specific tor instance (by index)
+tor_bootstrap_pct_inst() {
+    local idx="$1"
+    local sock="/run/tor/inst${idx}/control"
+    local cookie="/run/tor/inst${idx}/control.authcookie"
+    python3 -c "
+import socket, re
+try:
+    with open('${cookie}', 'rb') as f:
+        c = f.read().hex()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(5)
+    s.connect('${sock}')
+    s.send(f'AUTHENTICATE {c}\r\n'.encode())
+    s.recv(200)
+    s.send(b'GETINFO status/bootstrap-phase\r\n')
+    r = s.recv(500).decode()
+    s.close()
+    m = re.search(r'PROGRESS=(\d+)', r)
+    print(m.group(1) if m else '0')
+except:
+    print('0')
+" 2>/dev/null || echo "0"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -261,6 +289,132 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURE TOR (no bridges)
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# MULTI-TOR SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+get_tor_instances() {
+    local count
+    count=$(grep '^tor_instances=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2)
+    echo "${count:-1}"
+}
+
+configure_tor_instance() {
+    local idx="$1"        # 0, 1, 2
+    local mode="$2"       # direct | bridges
+    local bridges_file="${3:-}"
+    local socks_port="${TOR_PORTS[$idx]}"
+    local data_dir="/var/lib/tor/inst${idx}"
+    local run_dir="/run/tor/inst${idx}"
+    local torrc_file="/etc/tor/torrc.inst${idx}"
+    local control_sock="${run_dir}/control"
+
+    mkdir -p "$data_dir" "$run_dir"
+    chown debian-tor:debian-tor "$data_dir" "$run_dir" 2>/dev/null || true
+    chmod 700 "$data_dir"
+
+    {
+        echo "## tg-tor-proxy instance ${idx}"
+        echo "SocksPort 127.0.0.1:${socks_port}"
+        echo "DataDirectory ${data_dir}"
+        echo "PidFile ${run_dir}/tor.pid"
+        echo "ControlSocket ${control_sock} GroupWritable RelaxDirModeCheck"
+        echo "CookieAuthentication 1"
+        echo "CookieAuthFile ${run_dir}/control.authcookie"
+        echo "Log notice syslog"
+        echo "# Circuit stability"
+        echo "CircuitBuildTimeout 60"
+        echo "LearnCircuitBuildTimeout 0"
+        echo "MaxCircuitDirtiness 600"
+        echo "NumEntryGuards 4"
+        echo "NewCircuitPeriod 15"
+        echo "MaxClientCircuitsPending 128"
+        echo "KeepalivePeriod 30"
+        if [ "$mode" = "bridges" ] && [ -f "$bridges_file" ]; then
+            grep -q "^Bridge obfs4" "$bridges_file" && \
+                echo "ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy"
+            echo "UseBridges 1"
+            grep -v '^#' "$bridges_file" | grep -v '^$' | while read -r line; do
+                echo "$line" | grep -q "^Bridge " && echo "$line" || echo "Bridge $line"
+            done
+        fi
+    } > "$torrc_file"
+
+    # Systemd service for this instance
+    cat > "/etc/systemd/system/tg-tor-inst${idx}.service" << EOF
+[Unit]
+Description=Tor instance ${idx} for tg-tor-proxy
+After=network.target
+[Service]
+Type=notify
+User=debian-tor
+ExecStartPre=/usr/bin/tor --verify-config -f ${torrc_file}
+ExecStart=/usr/bin/tor -f ${torrc_file}
+ExecReload=/bin/kill -HUP \${MAINPID}
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Redsocks config for this instance
+    cat > "/etc/redsocks.conf.inst${idx}" << EOF
+base {
+    log_debug = off;
+    log_info = on;
+    log = "syslog:daemon";
+    daemon = off;
+    redirector = iptables;
+}
+redsocks {
+    local_ip = 0.0.0.0;
+    local_port = ${RS_PORTS[$idx]};
+    ip = 127.0.0.1;
+    port = ${socks_port};
+    type = socks5;
+}
+EOF
+
+    # Redsocks service for this instance
+    cat > "/etc/systemd/system/redsocks-inst${idx}.service" << EOF
+[Unit]
+Description=Redsocks instance ${idx} for tg-tor-proxy
+After=tg-tor-inst${idx}.service
+[Service]
+Type=simple
+ExecStart=/usr/sbin/redsocks -c /etc/redsocks.conf.inst${idx}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+start_tor_instances() {
+    local count="$1"
+    systemctl daemon-reload
+    for ((i=0; i<count; i++)); do
+        systemctl enable --now "tg-tor-inst${i}" 2>/dev/null || true
+        systemctl enable --now "redsocks-inst${i}" 2>/dev/null || true
+        log "Started tor instance ${i} (SOCKS :${TOR_PORTS[$i]}, redsocks :${RS_PORTS[$i]})"
+    done
+}
+
+stop_tor_instances() {
+    for i in 0 1 2; do
+        systemctl stop "tg-tor-inst${i}" 2>/dev/null || true
+        systemctl disable "tg-tor-inst${i}" 2>/dev/null || true
+        systemctl stop "redsocks-inst${i}" 2>/dev/null || true
+        systemctl disable "redsocks-inst${i}" 2>/dev/null || true
+        rm -f "/etc/systemd/system/tg-tor-inst${i}.service"
+        rm -f "/etc/systemd/system/redsocks-inst${i}.service"
+        rm -f "/etc/tor/torrc.inst${i}"
+        rm -f "/etc/redsocks.conf.inst${i}"
+    done
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 configure_tor_direct() {
     cat > "$TORRC" << 'TOREOF'
 ## Managed by tg-tor-proxy
@@ -403,6 +557,56 @@ wait_tor_bootstrap() {
     return 1
 }
 
+# Wait for a specific tor instance to bootstrap (used in multi-instance mode)
+wait_tor_instance_bootstrap() {
+    local idx="$1"
+    local max_wait="${2:-$BRIDGE_BOOTSTRAP_TIMEOUT}"
+    local use_sighup="${3:-false}"
+
+    local elapsed=0 interval=5 last_pct=-1 stuck_for=0 sighup_for=0
+
+    info "Ожидаю bootstrap инстанса ${idx} (max ${max_wait}s)..."
+
+    while [ $elapsed -lt $max_wait ]; do
+        local pct
+        pct=$(tor_bootstrap_pct_inst "$idx" 2>/dev/null || echo "0")
+        pct=${pct:-0}
+
+        local bar_len=30 filled=$(( pct * 30 / 100 )) bar=""
+        for ((i=0; i<filled; i++)); do bar+="█"; done
+        for ((i=filled; i<bar_len; i++)); do bar+="░"; done
+        printf "\r  [inst%d] [%s] %3d%% (%ds)" "$idx" "$bar" "$pct" "$elapsed"
+
+        if [ "$pct" -eq 100 ]; then
+            echo ""
+            log "Инстанс ${idx} загрузился!"
+            return 0
+        fi
+
+        if [ "$pct" -eq "$last_pct" ]; then
+            stuck_for=$((stuck_for + interval))
+            sighup_for=$((sighup_for + interval))
+            if $use_sighup && [ $sighup_for -ge "$BRIDGE_STUCK_SIGHUP" ]; then
+                echo ""
+                local pid
+                pid=$(systemctl show "tg-tor-inst${idx}" --property=MainPID --value 2>/dev/null || echo "0")
+                [ "$pid" != "0" ] && kill -HUP "$pid" 2>/dev/null || true
+                info "SIGHUP → inst${idx} (застрял на ${pct}%)"
+                sighup_for=0
+            fi
+        else
+            stuck_for=0; sighup_for=0; last_pct=$pct
+        fi
+
+        sleep $interval
+        elapsed=$((elapsed + interval))
+    done
+
+    echo ""
+    warn "Инстанс ${idx} не загрузился за ${max_wait}s (на ${last_pct}%)"
+    return 1
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST TOR DIRECT (no bridges)
 # Returns: 0 if direct works, 1 if needs bridges
@@ -522,17 +726,16 @@ generate_routes_script() {
         warn "No detected networks, using defaults: ${networks[*]}"
     fi
 
+    local tor_count="${1:-1}"
+
     cat > "$ROUTES_SCRIPT" << 'HEREDOC'
 #!/bin/bash
 # Managed by tg-tor-proxy — do not edit manually
-REDSOCKS_PORT=REDSOCKS_PORT_PLACEHOLDER
+TOR_COUNT=TOR_COUNT_PLACEHOLDER
+RS_PORTS=(RS_PORTS_PLACEHOLDER)
 
 TELEGRAM_NETS="
 TELEGRAM_NETS_PLACEHOLDER
-"
-
-SOURCE_NETS="
-SOURCE_NETS_PLACEHOLDER
 "
 
 IPT() { iptables-legacy "$@" 2>/dev/null || iptables "$@" 2>/dev/null; }
@@ -541,73 +744,82 @@ flush_rules() {
     IPT -t nat -F TELEGRAM_TOR 2>/dev/null
     IPT -t nat -D PREROUTING -j TELEGRAM_TOR 2>/dev/null
     IPT -t nat -X TELEGRAM_TOR 2>/dev/null
+    for i in 0 1 2; do
+        IPT -t nat -F "TELEGRAM_TOR_${i}" 2>/dev/null
+        IPT -t nat -X "TELEGRAM_TOR_${i}" 2>/dev/null
+    done
     return 0
 }
 
 add_rules() {
     IPT -t nat -N TELEGRAM_TOR 2>/dev/null || true
 
-    # Skip private/bogon destinations (these are routes, not sources)
+    # Skip bogon destinations
     for bogon in 0.0.0.0/8 10.0.0.0/8 127.0.0.0/8 169.254.0.0/16 \
                  192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
         IPT -t nat -A TELEGRAM_TOR -d "$bogon" -j RETURN
     done
 
-    # Redirect Telegram IPs to Redsocks
-    for net in $TELEGRAM_NETS; do
-        [ -z "$net" ] && continue
-        IPT -t nat -A TELEGRAM_TOR -p tcp -d "$net" -j REDIRECT --to-ports "$REDSOCKS_PORT"
-    done
+    if [ "$TOR_COUNT" -eq 1 ]; then
+        # Single instance — direct redirect
+        for net in $TELEGRAM_NETS; do
+            [ -z "$net" ] && continue
+            IPT -t nat -A TELEGRAM_TOR -p tcp -d "$net" \
+                -j REDIRECT --to-ports "${RS_PORTS[0]}"
+        done
+    else
+        # Multiple instances — round-robin via statistic module
+        for net in $TELEGRAM_NETS; do
+            [ -z "$net" ] && continue
+            for ((i=0; i<TOR_COUNT; i++)); do
+                remaining=$((TOR_COUNT - i))
+                if [ $remaining -eq 1 ]; then
+                    # Last one gets all remaining
+                    IPT -t nat -A TELEGRAM_TOR -p tcp -d "$net" \
+                        -j REDIRECT --to-ports "${RS_PORTS[$i]}"
+                else
+                    IPT -t nat -A TELEGRAM_TOR -p tcp -d "$net" \
+                        -m statistic --mode nth --every "$remaining" --packet 0 \
+                        -j REDIRECT --to-ports "${RS_PORTS[$i]}"
+                fi
+            done
+        done
+    fi
 
-    # Apply to traffic from VPN container networks
     IPT -t nat -I PREROUTING -j TELEGRAM_TOR
 }
 
 case "${1:-}" in
-    start)
-        flush_rules
-        add_rules
-        echo "Telegram → Tor rules applied"
-        ;;
-    stop)
-        flush_rules
-        echo "Telegram → Tor rules removed"
-        ;;
+    start) flush_rules; add_rules; echo "Telegram → Tor rules applied (${TOR_COUNT} instance(s))" ;;
+    stop)  flush_rules; echo "Telegram → Tor rules removed" ;;
     status)
         echo "=== TELEGRAM_TOR chain ==="
         IPT -t nat -L TELEGRAM_TOR -n --line-numbers 2>/dev/null || echo "Chain not found"
-        echo ""
-        echo "=== PREROUTING ==="
-        IPT -t nat -L PREROUTING -n --line-numbers 2>/dev/null | head -5
         ;;
-    *)
-        echo "Usage: $0 {start|stop|status}"
-        exit 1
-        ;;
+    *) echo "Usage: $0 {start|stop|status}"; exit 1 ;;
 esac
 HEREDOC
 
     # Substitute placeholders
     local tg_nets_str
     tg_nets_str=$(printf '%s\n' "${TELEGRAM_NETS[@]}")
-    local src_nets_str
-    src_nets_str=$(printf '%s\n' "${networks[@]}")
+    local rs_ports_str="${RS_PORTS[*]:0:$tor_count}"
 
-    sed -i "s|REDSOCKS_PORT_PLACEHOLDER|$REDSOCKS_PORT|g" "$ROUTES_SCRIPT"
-    # Use Python for safe multi-line substitution
-    python3 - "$ROUTES_SCRIPT" "$tg_nets_str" "$src_nets_str" << 'PYEOF'
+    sed -i "s|TOR_COUNT_PLACEHOLDER|${tor_count}|g" "$ROUTES_SCRIPT"
+    sed -i "s|RS_PORTS_PLACEHOLDER|${rs_ports_str}|g" "$ROUTES_SCRIPT"
+
+    python3 - "$ROUTES_SCRIPT" "$tg_nets_str" << 'PYEOF'
 import sys
-script_path, tg_nets, src_nets = sys.argv[1], sys.argv[2], sys.argv[3]
+script_path, tg_nets = sys.argv[1], sys.argv[2]
 with open(script_path) as f:
     content = f.read()
 content = content.replace('TELEGRAM_NETS_PLACEHOLDER', tg_nets)
-content = content.replace('SOURCE_NETS_PLACEHOLDER', src_nets)
 with open(script_path, 'w') as f:
     f.write(content)
 PYEOF
 
     chmod +x "$ROUTES_SCRIPT"
-    log "Routes script written: $ROUTES_SCRIPT"
+    log "Routes script written: $ROUTES_SCRIPT (${tor_count} Tor instance(s))"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -856,11 +1068,57 @@ cmd_install() {
         fi
     fi
 
-    # 6. Setup iptables
-    generate_routes_script
+    # 6. Ask for number of Tor instances
+    echo ""
+    hdr "Количество Tor-инстансов"
+    echo ""
+    echo -e "  ${CYAN}1${NC} — один инстанс    (до 15 клиентов)"
+    echo -e "  ${CYAN}2${NC} — два инстанса    (15-30 клиентов, рекомендуется)"
+    echo -e "  ${CYAN}3${NC} — три инстанса    (30-40+ клиентов)"
+    echo ""
+    read -rp "  Выберите количество [1-3, Enter = 1]: " inst_choice
+    local tor_instances=1
+    case "${inst_choice:-1}" in
+        2) tor_instances=2 ;;
+        3) tor_instances=3 ;;
+        *) tor_instances=1 ;;
+    esac
+
+    # Сохраняем в конфиг
+    {
+        grep -v '^tor_instances=' "$CONFIG_FILE" 2>/dev/null || true
+        echo "tor_instances=${tor_instances}"
+    } > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+    if [ "$tor_instances" -gt 1 ]; then
+        hdr "Настройка ${tor_instances} Tor-инстансов"
+
+        # Отключаем системные сервисы — их порты займут инстансы
+        systemctl stop tor@default redsocks 2>/dev/null || true
+        systemctl disable tor@default redsocks 2>/dev/null || true
+
+        local inst_mode
+        inst_mode=$(grep '^mode=' "$CONFIG_FILE" | cut -d= -f2 || echo "direct")
+
+        for ((i=0; i<tor_instances; i++)); do
+            info "Настраиваю инстанс ${i} (SOCKS :${TOR_PORTS[$i]}, redsocks :${RS_PORTS[$i]})..."
+            configure_tor_instance "$i" "$inst_mode" "$BRIDGES_FILE"
+        done
+
+        start_tor_instances "$tor_instances"
+
+        # Ждём bootstrap только инстанса 0; остальные догонят в фоне
+        local use_sig=false
+        $use_bridges && use_sig=true
+        wait_tor_instance_bootstrap 0 "$BRIDGE_BOOTSTRAP_TIMEOUT" "$use_sig" || \
+            warn "Инстанс 0 не загрузился за ${BRIDGE_BOOTSTRAP_TIMEOUT}s — продолжаем"
+    fi
+
+    # 7. Setup iptables
+    generate_routes_script "$tor_instances"
     apply_routes
 
-    # 7. Install systemd
+    # 8. Install systemd
     install_systemd_services
 
     # 8. Final test
@@ -926,6 +1184,10 @@ cmd_remove() {
         systemctl disable "$svc" 2>/dev/null || true
         rm -f "/etc/systemd/system/${svc}.service"
     done
+
+    # Stop multi-instance Tor and Redsocks services
+    stop_tor_instances
+
     # Remove systemd drop-ins
     rm -rf /etc/systemd/system/tor@default.service.d
     rm -rf /etc/systemd/system/redsocks.service.d
@@ -945,6 +1207,14 @@ cmd_remove() {
 
     # Remove scripts
     rm -f "$ROUTES_SCRIPT" "$BOOTSTRAP_SCRIPT"
+
+    # Remove multi-instance data directories
+    for i in 0 1 2; do
+        rm -rf "/var/lib/tor/inst${i}"
+        rm -rf "/run/tor/inst${i}"
+        rm -f "/etc/redsocks.conf.inst${i}"
+        rm -f "/etc/tor/torrc.inst${i}"
+    done
 
     # Remove config
     rm -rf "$CONFIG_DIR"
@@ -991,7 +1261,11 @@ cmd_diagnose() {
 
     # ── Services ──────────────────────────────────────────────────────────
     hdr "Services"
-    for svc in tor@default redsocks tg-tor-routes tg-tor-bootstrap tg-tor-proxy; do
+    local tor_instances
+    tor_instances=$(get_tor_instances)
+
+    print_svc_status() {
+        local svc="$1"
         local status
         status=$(systemctl is-active "$svc" 2>/dev/null; true)
         case "$status" in
@@ -1000,63 +1274,97 @@ cmd_diagnose() {
             "")       echo -e "  ${RED}●${NC} $svc — not found" ;;
             *)        echo -e "  ${RED}●${NC} $svc — $status" ;;
         esac
-    done
+    }
+
+    if [ "$tor_instances" -gt 1 ]; then
+        for ((i=0; i<tor_instances; i++)); do
+            print_svc_status "tg-tor-inst${i}"
+            print_svc_status "redsocks-inst${i}"
+        done
+    else
+        print_svc_status "tor@default"
+        print_svc_status "redsocks"
+    fi
+    print_svc_status "tg-tor-routes"
+    print_svc_status "tg-tor-watchdog"
 
     # ── Tor bootstrap ─────────────────────────────────────────────────────
     hdr "Tor Status"
     local pct mode_line
-    pct=$(tor_bootstrap_pct 2>/dev/null || echo "N/A")
-    echo -e "  Bootstrap: ${BOLD}${pct}%${NC}"
-
     if [ -f "$CONFIG_FILE" ]; then
-        mode_line=$(grep mode "$CONFIG_FILE" 2>/dev/null || echo "mode=unknown")
-        echo -e "  Mode: ${BOLD}${mode_line#mode=}${NC}"
+        mode_line=$(grep '^mode=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "unknown")
+        echo -e "  Mode: ${BOLD}${mode_line}${NC}   Инстансов: ${BOLD}${tor_instances}${NC}"
     fi
 
-    if [ "$pct" = "100" ]; then
-        # Test Tor SOCKS
-        local tor_ip
-        tor_ip=$(curl -s --connect-timeout 10 \
-            --socks5-hostname "127.0.0.1:$TOR_PORT" \
-            https://check.torproject.org/api/ip 2>/dev/null \
-            | grep -oP '"IP":"\K[^"]+' || echo "test failed")
-        echo -e "  Tor exit IP: ${BOLD}$tor_ip${NC}"
-
-        # Telegram connectivity via Tor
-        local tg_test
-        tg_test=$(curl -s --connect-timeout 10 \
-            --socks5-hostname "127.0.0.1:$TOR_PORT" \
-            -o /dev/null -w "%{http_code}" \
-            "https://149.154.167.51" -k 2>/dev/null || echo "0")
-        if [ "$tg_test" != "0" ]; then
-            echo -e "  Telegram via Tor: ${GREEN}reachable (HTTP $tg_test)${NC}"
-        else
-            echo -e "  Telegram via Tor: ${YELLOW}no HTTP response (normal for Telegram)${NC}"
+    if [ "$tor_instances" -gt 1 ]; then
+        local all_ready=true
+        for ((i=0; i<tor_instances; i++)); do
+            local ipct
+            ipct=$(tor_bootstrap_pct_inst "$i" 2>/dev/null || echo "0")
+            local color="${GREEN}"
+            [ "$ipct" != "100" ] && color="${YELLOW}" && all_ready=false
+            echo -e "  inst${i} bootstrap: ${color}${BOLD}${ipct}%${NC}  (SOCKS :${TOR_PORTS[$i]}, redsocks :${RS_PORTS[$i]})"
+        done
+        pct=$(tor_bootstrap_pct_inst 0 2>/dev/null || echo "0")
+        if $all_ready; then
+            local tor_ip
+            tor_ip=$(curl -s --connect-timeout 10 \
+                --socks5-hostname "127.0.0.1:${TOR_PORTS[0]}" \
+                https://check.torproject.org/api/ip 2>/dev/null \
+                | grep -oP '"IP":"\K[^"]+' || echo "test failed")
+            echo -e "  Tor exit IP (inst0): ${BOLD}$tor_ip${NC}"
         fi
     else
-        echo -e "  ${YELLOW}Tor not fully bootstrapped${NC}"
-        journalctl -u tor@default --no-pager -n 5 2>/dev/null | grep -E 'Bootstrap|warn|err' | \
-            sed 's/^/  /' || true
+        pct=$(tor_bootstrap_pct 2>/dev/null || echo "N/A")
+        echo -e "  Bootstrap: ${BOLD}${pct}%${NC}"
+
+        if [ "$pct" = "100" ]; then
+            local tor_ip
+            tor_ip=$(curl -s --connect-timeout 10 \
+                --socks5-hostname "127.0.0.1:$TOR_PORT" \
+                https://check.torproject.org/api/ip 2>/dev/null \
+                | grep -oP '"IP":"\K[^"]+' || echo "test failed")
+            echo -e "  Tor exit IP: ${BOLD}$tor_ip${NC}"
+        else
+            echo -e "  ${YELLOW}Tor not fully bootstrapped${NC}"
+            journalctl -u tor@default --no-pager -n 5 2>/dev/null | grep -E 'Bootstrap|warn|err' | \
+                sed 's/^/  /' || true
+        fi
     fi
 
     # Bridges info
-    if [ -f "$TORRC" ] && grep -q "UseBridges 1" "$TORRC"; then
+    local bridges_torrc="$TORRC"
+    [ "$tor_instances" -gt 1 ] && bridges_torrc="/etc/tor/torrc.inst0"
+    if [ -f "$bridges_torrc" ] && grep -q "UseBridges 1" "$bridges_torrc"; then
         echo ""
         echo -e "  Configured bridges:"
-        grep "^Bridge" "$TORRC" 2>/dev/null | while read -r b; do
+        grep "^Bridge" "$bridges_torrc" 2>/dev/null | while read -r b; do
             echo "    $(echo "$b" | cut -c1-70)"
         done
     fi
 
     # ── Redsocks ──────────────────────────────────────────────────────────
     hdr "Redsocks"
-    local rs_connections
-    rs_connections=$(ss -tn | grep -c ":$REDSOCKS_PORT" 2>/dev/null || echo "0")
-    echo -e "  Active connections: ${BOLD}$rs_connections${NC}"
-
-    local rs_listen
-    rs_listen=$(ss -tlnp | grep ":$REDSOCKS_PORT" | head -1 | awk '{print $4}')
-    echo -e "  Listening on: ${rs_listen:-not listening}"
+    if [ "$tor_instances" -gt 1 ]; then
+        local total_conns=0
+        for ((i=0; i<tor_instances; i++)); do
+            local rport="${RS_PORTS[$i]}"
+            local conns
+            conns=$(ss -tn 2>/dev/null | grep -c ":${rport}" || echo "0")
+            local rl
+            rl=$(ss -tlnp 2>/dev/null | grep ":${rport}" | head -1 | awk '{print $4}')
+            echo -e "  redsocks-inst${i} :${rport} — соединений: ${BOLD}${conns}${NC}  ${rl:-не слушает}"
+            total_conns=$((total_conns + conns))
+        done
+        echo -e "  Всего соединений: ${BOLD}${total_conns}${NC}"
+    else
+        local rs_connections
+        rs_connections=$(ss -tn 2>/dev/null | grep -c ":$REDSOCKS_PORT" || echo "0")
+        echo -e "  Active connections: ${BOLD}$rs_connections${NC}"
+        local rs_listen
+        rs_listen=$(ss -tlnp 2>/dev/null | grep ":$REDSOCKS_PORT" | head -1 | awk '{print $4}')
+        echo -e "  Listening on: ${rs_listen:-not listening}"
+    fi
 
     # Recent Telegram sessions
     echo "  Recent Telegram sessions (last 10):"
@@ -1137,12 +1445,24 @@ cmd_diagnose() {
     local fixes=()
 
     # Собираем список проблем
-    if ! systemctl is-active --quiet redsocks 2>/dev/null; then
-        fixes+=("redsocks")
+    if [ "$tor_instances" -gt 1 ]; then
+        for ((i=0; i<tor_instances; i++)); do
+            if ! systemctl is-active --quiet "tg-tor-inst${i}" 2>/dev/null; then
+                fixes+=("tor-inst${i}")
+            fi
+            if ! systemctl is-active --quiet "redsocks-inst${i}" 2>/dev/null; then
+                fixes+=("redsocks-inst${i}")
+            fi
+        done
+    else
+        if ! systemctl is-active --quiet redsocks 2>/dev/null; then
+            fixes+=("redsocks")
+        fi
+        if ! systemctl is-active --quiet tor@default 2>/dev/null; then
+            fixes+=("tor")
+        fi
     fi
-    if ! systemctl is-active --quiet tor@default 2>/dev/null; then
-        fixes+=("tor")
-    fi
+
     local chain_fix
     chain_fix=$(iptables_cmd -t nat -L TELEGRAM_TOR 2>/dev/null | wc -l || echo 0)
     if [ "$chain_fix" -le 5 ]; then
@@ -1162,24 +1482,33 @@ cmd_diagnose() {
                 case "$fix" in
                     redsocks)
                         info "Запускаю redsocks..."
-                        systemctl restart redsocks && log "redsocks запущен" || warn "Не удалось запустить redsocks"
+                        systemctl restart redsocks && log "redsocks запущен" || warn "Не удалось"
                         ;;
                     tor)
                         info "Запускаю tor@default..."
-                        systemctl restart tor@default && log "Tor запущен" || warn "Не удалось запустить Tor"
+                        systemctl restart tor@default && log "Tor запущен" || warn "Не удалось"
+                        ;;
+                    tor-inst*)
+                        local svc="tg-tor-${fix}"
+                        info "Запускаю ${svc}..."
+                        systemctl restart "$svc" && log "${svc} запущен" || warn "Не удалось"
+                        ;;
+                    redsocks-inst*)
+                        info "Запускаю ${fix}..."
+                        systemctl restart "$fix" && log "${fix} запущен" || warn "Не удалось"
                         ;;
                     iptables)
                         info "Применяю iptables правила..."
                         if [ -x "$ROUTES_SCRIPT" ]; then
                             bash "$ROUTES_SCRIPT" stop 2>/dev/null || true
-                            bash "$ROUTES_SCRIPT" start && log "iptables правила применены" || warn "Ошибка применения правил"
+                            bash "$ROUTES_SCRIPT" start && log "iptables правила применены" || warn "Ошибка"
                         else
                             warn "Скрипт правил не найден — запустите установку (пункт 1)"
                         fi
                         ;;
                     watchdog)
                         info "Запускаю watchdog..."
-                        systemctl restart tg-tor-watchdog && log "Watchdog запущен" || warn "Не удалось запустить watchdog"
+                        systemctl restart tg-tor-watchdog && log "Watchdog запущен" || warn "Не удалось"
                         ;;
                 esac
             done
