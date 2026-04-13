@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 1.9.1
+# Version: 2.0.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="1.9.1"
+readonly VERSION="2.0.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1315,23 +1315,27 @@ cmd_update() {
     esac
 
     local ts; ts=$(date +%s)
-    local script_url="${raw_base}/${branch}/tg-tor-proxy.sh?${ts}"
-    local watchdog_url="${raw_base}/${branch}/tg-tor-watchdog.sh?${ts}"
-    # GitHub API — не кешируется CDN, всегда отдаёт актуальную версию
-    local api_base="https://api.github.com/repos/${gh_repo}/contents"
+    local api_base="https://api.github.com/repos/${gh_repo}"
 
     echo ""
-    info "Проверяю версию в ветке '${branch}'..."
+    info "Проверяю версию..."
 
-    local remote_version
-    # Сначала пробуем через API (обходит CDN кеш)
-    remote_version=$(curl -fsSL --connect-timeout 10 \
-        -H "Accept: application/vnd.github.raw" \
-        "${api_base}/tg-tor-proxy.sh?ref=${branch}" 2>/dev/null \
-        | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"' || true)
-    # Fallback на raw если API недоступен
-    if [ -z "$remote_version" ]; then
-        remote_version=$(curl -fsSL --connect-timeout 10 "$script_url" 2>/dev/null \
+    local remote_version release_download_url=""
+
+    if [ "$branch" = "main" ]; then
+        # Stable: используем GitHub Releases API — не кешируется, всегда актуально
+        local release_json
+        release_json=$(curl -fsSL --connect-timeout 10 \
+            "${api_base}/releases/latest" 2>/dev/null || true)
+        remote_version=$(echo "$release_json" | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || true)
+        # URL для скачивания из релиза
+        release_download_url=$(echo "$release_json" \
+            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-proxy\.sh' | head -1 || true)
+    else
+        # Testing: берём из ветки через API contents
+        remote_version=$(curl -fsSL --connect-timeout 10 \
+            -H "Accept: application/vnd.github.raw" \
+            "${api_base}/contents/tg-tor-proxy.sh?ref=${branch}&ts=${ts}" 2>/dev/null \
             | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"' || true)
     fi
 
@@ -1360,11 +1364,9 @@ cmd_update() {
 
     echo ""
     info "Скачиваю tg-tor-proxy..."
-    if curl -fsSL --connect-timeout 15 \
-        -H "Accept: application/vnd.github.raw" \
-        "${api_base}/tg-tor-proxy.sh?ref=${branch}" \
-        -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null \
-        || curl -fsSL --connect-timeout 15 "$script_url" -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null; then
+    local dl_script="${release_download_url:-}"
+    [ -z "$dl_script" ] && dl_script="${raw_base}/${branch}/tg-tor-proxy.sh?${ts}"
+    if curl -fsSL --connect-timeout 15 "$dl_script" -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-proxy.new
         mv /usr/local/bin/tg-tor-proxy.new /usr/local/bin/tg-tor-proxy
         # Сохраняем выбранный канал
@@ -1379,11 +1381,11 @@ cmd_update() {
     fi
 
     info "Скачиваю watchdog..."
-    if curl -fsSL --connect-timeout 15 \
-        -H "Accept: application/vnd.github.raw" \
-        "${api_base}/tg-tor-watchdog.sh?ref=${branch}" \
-        -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null \
-        || curl -fsSL --connect-timeout 15 "$watchdog_url" -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null; then
+    local wd_dl_url
+    wd_dl_url=$(echo "${release_json:-}" \
+        | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-watchdog\.sh' | head -1 || true)
+    [ -z "$wd_dl_url" ] && wd_dl_url="${raw_base}/${branch}/tg-tor-watchdog.sh?${ts}"
+    if curl -fsSL --connect-timeout 15 "$wd_dl_url" -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-watchdog.sh.new
         mv /usr/local/bin/tg-tor-watchdog.sh.new /usr/local/bin/tg-tor-watchdog.sh
         systemctl restart tg-tor-watchdog 2>/dev/null || true
