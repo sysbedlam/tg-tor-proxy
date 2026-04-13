@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.1.2
+# Version: 2.1.3
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.2"
+readonly VERSION="2.1.3"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -826,6 +826,7 @@ PYEOF
 # INSTALL SYSTEMD SERVICES
 # ─────────────────────────────────────────────────────────────────────────────
 install_systemd_services() {
+    local tor_count_arg="${1:-1}"
     hdr "Installing systemd services"
 
     # Bootstrap watcher (handles stuck Tor)
@@ -872,8 +873,7 @@ BSEOF
     chmod +x "$BOOTSTRAP_SCRIPT"
 
     # Routes service — dependency varies by single vs multi-instance
-    local tor_count_now
-    tor_count_now=$(get_tor_instances)
+    local tor_count_now="$tor_count_arg"
     local routes_after routes_wants
     if [ "$tor_count_now" -gt 1 ]; then
         routes_after="network.target tg-tor-inst0.service"
@@ -1138,7 +1138,7 @@ cmd_install() {
     apply_routes
 
     # 8. Install systemd
-    install_systemd_services
+    install_systemd_services "$tor_instances"
 
     # 8. Final test
     hdr "Final verification"
@@ -1369,16 +1369,16 @@ cmd_diagnose() {
         for ((i=0; i<tor_instances; i++)); do
             local rport="${RS_PORTS[$i]}"
             local conns
-            conns=$(ss -tn 2>/dev/null | grep -c ":${rport}" || echo "0")
+            conns=$(ss -tn 2>/dev/null | grep ":${rport}" | wc -l)
             local rl
             rl=$(ss -tlnp 2>/dev/null | grep ":${rport}" | head -1 | awk '{print $4}')
-            echo -e "  redsocks-inst${i} :${rport} — соединений: ${BOLD}${conns}${NC}  ${rl:-не слушает}"
+            echo -e "  redsocks-inst${i} :${rport} — соединений: ${BOLD}${conns}${NC}  ${rl:-(не слушает)}"
             total_conns=$((total_conns + conns))
         done
         echo -e "  Всего соединений: ${BOLD}${total_conns}${NC}"
     else
         local rs_connections
-        rs_connections=$(ss -tn 2>/dev/null | grep -c ":$REDSOCKS_PORT" || echo "0")
+        rs_connections=$(ss -tn 2>/dev/null | grep ":$REDSOCKS_PORT" | wc -l)
         echo -e "  Active connections: ${BOLD}$rs_connections${NC}"
         local rs_listen
         rs_listen=$(ss -tlnp 2>/dev/null | grep ":$REDSOCKS_PORT" | head -1 | awk '{print $4}')
@@ -1387,9 +1387,15 @@ cmd_diagnose() {
 
     # Recent Telegram sessions
     echo "  Recent Telegram sessions (last 10):"
+    local rs_jctl_args=(-t redsocks)
+    if [ "$tor_instances" -gt 1 ]; then
+        for ((i=0; i<tor_instances; i++)); do
+            rs_jctl_args+=(-u "redsocks-inst${i}")
+        done
+    fi
     local sessions
-    sessions=$(journalctl -t redsocks --no-pager -n 200 2>/dev/null \
-        | grep 'accepted' | tail -10 \
+    sessions=$(journalctl "${rs_jctl_args[@]}" --no-pager -n 300 2>/dev/null \
+        | grep -E '\[.*->.*\]: accepted' | tail -10 \
         | grep -oP '\[\K[^\]]+(?=\]: accepted)' || true)
     if [ -n "$sessions" ]; then
         echo "$sessions" | sed 's/^/    /'
@@ -1971,9 +1977,17 @@ interactive_menu() {
                 hdr "Активные Telegram-сессии (Ctrl+C для выхода)"
                 echo -e "${CYAN}Формат: клиент:порт → Telegram_IP:порт${NC}"
                 echo ""
-                journalctl -t redsocks -f --no-pager 2>/dev/null | \
-                    grep --line-buffered 'accepted\|closed' | \
-                    grep -oP '\[\K[^\]]+(?=\]: (accepted|closed))' | \
+                local rs_jctl=(-t redsocks)
+                local live_count
+                live_count=$(get_tor_instances)
+                if [ "$live_count" -gt 1 ]; then
+                    for ((li=0; li<live_count; li++)); do
+                        rs_jctl+=(-u "redsocks-inst${li}")
+                    done
+                fi
+                journalctl "${rs_jctl[@]}" -f --no-pager 2>/dev/null | \
+                    grep --line-buffered -E '\[.*->.*\]' | \
+                    grep --line-buffered -oP 'redsocks\[\d+\]: \K\[.*\]: .*' | \
                     sed 's/^/  /' || true
                 echo ""
                 read -rp "  Нажмите Enter для возврата в меню..." _dummy
