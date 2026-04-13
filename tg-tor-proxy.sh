@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.1.5
+# Version: 2.1.6
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.5"
+readonly VERSION="2.1.6"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1368,20 +1368,18 @@ cmd_diagnose() {
         local total_conns=0
         for ((i=0; i<tor_instances; i++)); do
             local rport="${RS_PORTS[$i]}"
-            local conns
-            conns=$(ss -tn 2>/dev/null | grep ":${rport}" | wc -l)
-            local rl
-            rl=$(ss -tlnp 2>/dev/null | grep ":${rport}" | head -1 | awk '{print $4}')
+            local conns rl
+            conns=$(ss -tn 2>/dev/null | grep ":${rport}" | wc -l) || conns=0
+            rl=$(ss -tlnp 2>/dev/null | grep ":${rport}" | head -1 | awk '{print $4}') || rl=""
             echo -e "  redsocks-inst${i} :${rport} — соединений: ${BOLD}${conns}${NC}  ${rl:-(не слушает)}"
             total_conns=$((total_conns + conns))
         done
         echo -e "  Всего соединений: ${BOLD}${total_conns}${NC}"
     else
-        local rs_connections
-        rs_connections=$(ss -tn 2>/dev/null | grep ":$REDSOCKS_PORT" | wc -l)
+        local rs_connections rs_listen
+        rs_connections=$(ss -tn 2>/dev/null | grep ":$REDSOCKS_PORT" | wc -l) || rs_connections=0
+        rs_listen=$(ss -tlnp 2>/dev/null | grep ":$REDSOCKS_PORT" | head -1 | awk '{print $4}') || rs_listen=""
         echo -e "  Active connections: ${BOLD}$rs_connections${NC}"
-        local rs_listen
-        rs_listen=$(ss -tlnp 2>/dev/null | grep ":$REDSOCKS_PORT" | head -1 | awk '{print $4}')
         echo -e "  Listening on: ${rs_listen:-not listening}"
     fi
 
