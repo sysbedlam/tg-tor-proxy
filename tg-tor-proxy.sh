@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.3"
+readonly VERSION="2.2.4"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1394,12 +1394,15 @@ cmd_diagnose() {
         done
         pct=$(tor_bootstrap_pct_inst 0 2>/dev/null || echo "0")
         if $all_ready; then
-            local tor_ip
-            tor_ip=$(curl -s --connect-timeout 10 \
-                --socks5-hostname "127.0.0.1:${TOR_PORTS[0]}" \
-                https://check.torproject.org/api/ip 2>/dev/null \
-                | grep -oP '"IP":"\K[^"]+' || echo "test failed")
-            echo -e "  Tor exit IP (inst0): ${BOLD}$tor_ip${NC}"
+            # Показываем exit IP для каждого инстанса
+            for ((i=0; i<tor_count; i++)); do
+                local tor_ip
+                tor_ip=$(curl -s --connect-timeout 10 \
+                    --socks5-hostname "127.0.0.1:${TOR_PORTS[$i]}" \
+                    https://check.torproject.org/api/ip 2>/dev/null \
+                    | grep -oP '"IP":"\K[^"]+' || echo "недоступен")
+                echo -e "  Tor exit IP (inst${i}): ${BOLD}${tor_ip}${NC}"
+            done
         fi
     else
         pct=$(tor_bootstrap_pct 2>/dev/null || echo "N/A")
