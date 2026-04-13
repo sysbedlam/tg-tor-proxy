@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 1.8.0
+# Version: 1.9.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="1.8.0"
+readonly VERSION="1.9.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1317,13 +1317,23 @@ cmd_update() {
     local ts; ts=$(date +%s)
     local script_url="${raw_base}/${branch}/tg-tor-proxy.sh?${ts}"
     local watchdog_url="${raw_base}/${branch}/tg-tor-watchdog.sh?${ts}"
+    # GitHub API — не кешируется CDN, всегда отдаёт актуальную версию
+    local api_base="https://api.github.com/repos/${gh_repo}/contents"
 
     echo ""
     info "Проверяю версию в ветке '${branch}'..."
 
     local remote_version
-    remote_version=$(curl -fsSL --connect-timeout 10 "$script_url" 2>/dev/null \
+    # Сначала пробуем через API (обходит CDN кеш)
+    remote_version=$(curl -fsSL --connect-timeout 10 \
+        -H "Accept: application/vnd.github.raw" \
+        "${api_base}/tg-tor-proxy.sh?ref=${branch}" 2>/dev/null \
         | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"' || true)
+    # Fallback на raw если API недоступен
+    if [ -z "$remote_version" ]; then
+        remote_version=$(curl -fsSL --connect-timeout 10 "$script_url" 2>/dev/null \
+            | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"' || true)
+    fi
 
     if [ -z "$remote_version" ]; then
         warn "Не удалось получить версию с GitHub. Проверьте соединение или название ветки."
@@ -1350,7 +1360,11 @@ cmd_update() {
 
     echo ""
     info "Скачиваю tg-tor-proxy..."
-    if curl -fsSL --connect-timeout 15 "$script_url" -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null; then
+    if curl -fsSL --connect-timeout 15 \
+        -H "Accept: application/vnd.github.raw" \
+        "${api_base}/tg-tor-proxy.sh?ref=${branch}" \
+        -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null \
+        || curl -fsSL --connect-timeout 15 "$script_url" -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-proxy.new
         mv /usr/local/bin/tg-tor-proxy.new /usr/local/bin/tg-tor-proxy
         # Сохраняем выбранный канал
@@ -1365,7 +1379,11 @@ cmd_update() {
     fi
 
     info "Скачиваю watchdog..."
-    if curl -fsSL --connect-timeout 15 "$watchdog_url" -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null; then
+    if curl -fsSL --connect-timeout 15 \
+        -H "Accept: application/vnd.github.raw" \
+        "${api_base}/tg-tor-watchdog.sh?ref=${branch}" \
+        -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null \
+        || curl -fsSL --connect-timeout 15 "$watchdog_url" -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-watchdog.sh.new
         mv /usr/local/bin/tg-tor-watchdog.sh.new /usr/local/bin/tg-tor-watchdog.sh
         systemctl restart tg-tor-watchdog 2>/dev/null || true
