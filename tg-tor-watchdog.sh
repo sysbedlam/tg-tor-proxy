@@ -145,8 +145,8 @@ check_instance() {
             fi
         fi
 
-        # Keepalive every 30s (3 ticks × 10s) — keeps circuits warm for faster connections
-        if [ $(( ${KEEPALIVE_TICKS[$idx]} % 3 )) -eq 0 ]; then
+        # Keepalive every 2 min (12 ticks × 10s)
+        if [ $(( ${KEEPALIVE_TICKS[$idx]} % 12 )) -eq 0 ]; then
             keepalive_tor "$tor_port"
         fi
 
@@ -246,8 +246,7 @@ else
                 fi
             fi
 
-            # Keepalive every 30s (3 ticks × 10s) — keeps circuits warm for faster connections
-            if [ $((KEEPALIVE_TICKS_S % 3)) -eq 0 ]; then
+            if [ $((KEEPALIVE_TICKS_S % 12)) -eq 0 ]; then
                 keepalive_tor 9050
             fi
 
