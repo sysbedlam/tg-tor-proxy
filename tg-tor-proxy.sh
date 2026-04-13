@@ -111,7 +111,7 @@ except Exception as e:
 
 tor_bootstrap_pct() {
     local resp
-    resp=$(tor_query "GETINFO status/bootstrap-phase" 2>/dev/null) || echo "0"
+    resp=$(tor_query "GETINFO status/bootstrap-phase" 2>/dev/null) || true
     echo "$resp" | grep -oP 'PROGRESS=\K\d+' || echo "0"
 }
 
