@@ -1749,7 +1749,9 @@ cmd_update() {
     fi
 
     echo ""
-    log "Готово! Перезапустите tg-tor-proxy чтобы увидеть новую версию."
+    log "Обновление завершено! Перезапускаю..."
+    sleep 1
+    exec /usr/local/bin/tg-tor-proxy
 }
 
 cmd_check_tor() {
