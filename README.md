@@ -15,12 +15,14 @@ VPN клиент → AWG/Xray контейнер → iptables → redsocks → T
 - 🔍 **Авто-обнаружение** контейнеров AmneziaWG, Xray, V2Ray, Sing-Box
 - 🧅 **Tor без мостов** — сначала проверяет прямое подключение
 - 🌉 **obfs4-мосты** — если Tor заблокирован провайдером (DPI)
-- 🔄 **Watchdog** — постоянный мониторинг: SIGHUP при зависшем bootstrap, автоперезапуск Tor и Redsocks
-- 🛡️ **Стабильность** — оптимальные настройки Tor-каналов, `Restart=always`, fd-лимиты для Redsocks
+- ⚖️ **1-3 Tor инстанса** с round-robin балансировкой — до 40 VPN клиентов
+- 🔄 **Watchdog** — мониторинг каждые 10с: SIGHUP при зависшем bootstrap, автоперезапуск Tor и Redsocks
+- 🛡️ **Безопасность** — redsocks закрыт от внешнего доступа, запускается не от root, правила iptables переживают ребут
+- ⚡ **Оптимизация латентности** — OptimisticData, CircuitStreamTimeout, keepalive каждые 30с
+- 🔁 **Авто-обновление** — два канала (stable / testing), конфигурация применяется автоматически
 - 🗑️ **Полное удаление** одним пунктом меню
 - 📊 **Диагностика** — полный отчёт о состоянии всей цепочки
 - 📡 **Live-мониторинг** Telegram-сессий в реальном времени
-- 💾 **Автозапуск** через systemd при перезагрузке
 
 ---
 
@@ -53,11 +55,11 @@ sudo tg-tor-proxy
 
 ```
 ╔══════════════════════════════════════════════╗
-║   tg-tor-proxy  v1.3.0                      ║
+║   tg-tor-proxy  v2.2.x                      ║
 ║   Telegram через Tor для VPN-клиентов        ║
 ╚══════════════════════════════════════════════╝
 
-  Tor ● 100% (bridges)   Redsocks ●   iptables ●
+  Tor ● 100% (bridges) ×2   Redsocks ●   iptables ●
 
   Выберите действие:
 
@@ -68,7 +70,8 @@ sudo tg-tor-proxy
   5)  Загрузить мосты из файла
   6)  Применить iptables правила (если слетели)
   7)  Показать активные Telegram-сессии (live)
-  8)  Удалить всё (deinstall)
+  8)  Обновить tg-tor-proxy
+  9)  Удалить всё (deinstall)
   0)  Выход
 ```
 
@@ -82,6 +85,7 @@ sudo tg-tor-proxy
 | `tg-tor-proxy --add-bridges "obfs4 ..."` | Добавить мосты строкой |
 | `tg-tor-proxy --add-bridges-file FILE` | Загрузить мосты из файла |
 | `tg-tor-proxy --apply-rules` | Применить iptables правила заново |
+| `tg-tor-proxy --update` | Обновить до последней версии |
 | `tg-tor-proxy --remove` | Удалить всё |
 
 ---
@@ -89,17 +93,47 @@ sudo tg-tor-proxy
 ## Что происходит при установке
 
 1. Ищет Docker-контейнеры с VPN (amnezia, awg, xray, v2ray, sing-box, outline)
-2. Устанавливает пакеты: `tor`, `redsocks`, `obfs4proxy`
+2. Устанавливает пакеты: `tor`, `redsocks`, `obfs4proxy`, `netfilter-persistent`
 3. Тестирует **прямое** подключение к Tor (без мостов)
    - Если работает → настраивает без мостов
    - Если заблокировано DPI → запрашивает obfs4-мосты
-4. Настраивает **redsocks** (`0.0.0.0:12345` → Tor SOCKS5)
-5. Создаёт цепочку **iptables** `TELEGRAM_TOR` — перенаправляет 49 подсетей Telegram
-6. Устанавливает **systemd-сервисы** с автозапуском:
-   - `tg-tor-watchdog` — постоянный демон: SIGHUP при зависании, автоперезапуск при сбое
+4. Спрашивает количество Tor-инстансов (1-3) под нагрузку
+5. Настраивает **redsocks** (`0.0.0.0:12345+` → Tor SOCKS5), запускает от пользователя `redsocks`
+6. Создаёт цепочку **iptables** `TELEGRAM_TOR` — перенаправляет 49 подсетей Telegram
+7. Закрывает порты redsocks от внешнего доступа (INPUT chain)
+8. Сохраняет правила iptables через `netfilter-persistent` (переживают ребут)
+9. Устанавливает **systemd-сервисы** с автозапуском:
+   - `tg-tor-watchdog` — постоянный демон мониторинга
+   - `tg-tor-routes` — восстанавливает iptables при старте
    - `Restart=always` для Tor и Redsocks
-   - `LimitNOFILE=65536` для Redsocks (защита от fd-исчерпания)
-   - Параметры Tor: `NumEntryGuards`, `NewCircuitPeriod`, `MaxClientCircuitsPending`
+
+---
+
+## Масштабирование под нагрузку
+
+При установке выбирается количество Tor-инстансов:
+
+| Инстансов | Клиентов | Порты Tor | Порты Redsocks |
+|-----------|----------|-----------|----------------|
+| 1 | до 15 | 9050 | 12345 |
+| 2 | 15–30 | 9050, 9052 | 12345, 12346 |
+| 3 | 30–40+ | 9050, 9052, 9053 | 12345, 12346, 12347 |
+
+Трафик распределяется через iptables round-robin (`-m statistic --mode nth`).
+
+---
+
+## Обновление
+
+```bash
+sudo tg-tor-proxy --update
+```
+
+Доступны два канала:
+- **stable** (`main`) — проверенные версии
+- **testing** (`fix/direct-mode-stability`) — новые функции перед выходом в stable
+
+После обновления `auto_migrate()` автоматически применяет все изменения конфигурации — устанавливает недостающие пакеты, обновляет конфиги, перезапускает сервисы. Ничего делать вручную не нужно.
 
 ---
 
@@ -132,26 +166,27 @@ sudo tg-tor-proxy --diagnose
 Пример вывода:
 ```
 ══ Services ══
-  ● tor@default — active
-  ● redsocks    — active
-  ● tg-tor-routes — active
+  ● tg-tor-inst0  — active
+  ● tg-tor-inst1  — active
+  ● redsocks-inst0 — active
+  ● redsocks-inst1 — active
+  ● tg-tor-watchdog — active
 
 ══ Tor Status ══
-  Bootstrap: 100%
-  Mode: bridges
+  [inst0] Bootstrap: 100% | Mode: bridges
+  [inst1] Bootstrap: 100% | Mode: bridges
   Tor exit IP: 185.220.101.x
 
 ══ Redsocks ══
-  Active connections: 12
-  Listening on: 0.0.0.0:12345
+  Active connections: 24
   Recent Telegram sessions (last 10):
-    172.29.172.2:36540->149.154.167.41:443
-    172.29.172.2:57510->149.154.167.51:5222
-    ...
+    172.29.172.2:36540 → 149.154.167.41:443
+    172.29.172.2:57510 → 149.154.167.51:5222
 
 ══ iptables Rules ══
   TELEGRAM_TOR chain: active (58 lines)
   PREROUTING: linked
+  Redsocks ports: protected (INPUT DROP)
 ```
 
 ### Мониторинг сессий в реальном времени
@@ -159,6 +194,17 @@ sudo tg-tor-proxy --diagnose
 ```bash
 journalctl -t redsocks -f
 ```
+
+---
+
+## Безопасность
+
+| Угроза | Защита |
+|--------|--------|
+| Внешние подключения к redsocks | iptables INPUT: ACCEPT private, DROP остальное |
+| redsocks от root | Запускается от user=redsocks/group=redsocks |
+| Потеря правил после ребута | netfilter-persistent сохраняет rules.v4 |
+| Tor exit node через ваш сервер | Не relay, не exit — только клиент |
 
 ---
 
@@ -176,10 +222,20 @@ sudo tg-tor-proxy --remove
 
 | Компонент | Роль |
 |-----------|------|
-| **iptables PREROUTING** | Перехватывает TCP к Telegram-IP → порт 12345 |
+| **iptables PREROUTING** | Перехватывает TCP к Telegram-IP → redsocks (round-robin) |
 | **redsocks** | Прозрачный прокси: TCP → Tor SOCKS5 |
 | **Tor + obfs4** | Туннель через цензуру к Telegram |
-| **Watchdog** | SIGHUP если Tor завис на bootstrap (типично при DPI) |
+| **Watchdog** | SIGHUP если Tor завис, keepalive каждые 30с для тёплых цепочек |
+| **auto_migrate()** | Применяет изменения конфигурации при обновлении версии |
+
+### Оптимизация латентности Tor
+
+```
+OptimisticData 1        — отправка данных без ожидания ACK от каждого узла
+CircuitStreamTimeout 15 — быстрое переключение на запасную цепочку
+CircuitBuildTimeout 30  — быстрый отказ от медленных путей
+KeepalivePeriod 30      — keepalive каждые 30с
+```
 
 ### Telegram IP-подсети (49 штук)
 
