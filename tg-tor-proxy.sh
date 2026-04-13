@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.1.6
+# Version: 2.1.7
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.6"
+readonly VERSION="2.1.7"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -748,7 +748,26 @@ flush_rules() {
         IPT -t nat -F "TELEGRAM_TOR_${i}" 2>/dev/null
         IPT -t nat -X "TELEGRAM_TOR_${i}" 2>/dev/null
     done
+    # Remove redsocks port protection rules
+    for port in "${RS_PORTS[@]}"; do
+        for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+            IPT -D INPUT -p tcp --dport "$port" -s "$net" -j ACCEPT 2>/dev/null || true
+        done
+        IPT -D INPUT -p tcp --dport "$port" -j DROP 2>/dev/null || true
+    done
     return 0
+}
+
+protect_redsocks_ports() {
+    # Block external access to redsocks ports — allow only private/docker ranges
+    for port in "${RS_PORTS[@]}"; do
+        for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+            IPT -C INPUT -p tcp --dport "$port" -s "$net" -j ACCEPT 2>/dev/null || \
+            IPT -I INPUT -p tcp --dport "$port" -s "$net" -j ACCEPT
+        done
+        IPT -C INPUT -p tcp --dport "$port" -j DROP 2>/dev/null || \
+        IPT -A INPUT -p tcp --dport "$port" -j DROP
+    done
 }
 
 add_rules() {
@@ -790,7 +809,7 @@ add_rules() {
 }
 
 case "${1:-}" in
-    start) flush_rules; add_rules; echo "Telegram → Tor rules applied (${TOR_COUNT} instance(s))" ;;
+    start) flush_rules; add_rules; protect_redsocks_ports; echo "Telegram → Tor rules applied (${TOR_COUNT} instance(s))" ;;
     stop)  flush_rules; echo "Telegram → Tor rules removed" ;;
     status)
         echo "=== TELEGRAM_TOR chain ==="
