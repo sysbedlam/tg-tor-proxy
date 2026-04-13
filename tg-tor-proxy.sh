@@ -1843,16 +1843,25 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 show_menu() {
     # Quick one-line status for menu header
-    local tor_status redsocks_status rules_status tor_pct
-    tor_status=$(systemctl is-active tor@default 2>/dev/null; true)
-    redsocks_status=$(systemctl is-active redsocks 2>/dev/null; true)
-    tor_pct=$(tor_bootstrap_pct 2>/dev/null || echo "?")
+    local tor_status redsocks_status tor_pct
+    local tor_count
+    tor_count=$(get_tor_instances)
+
+    if [ "$tor_count" -gt 1 ]; then
+        tor_status=$(systemctl is-active "tg-tor-inst0" 2>/dev/null; true)
+        redsocks_status=$(systemctl is-active "redsocks-inst0" 2>/dev/null; true)
+        tor_pct=$(tor_bootstrap_pct_inst 0 2>/dev/null || echo "?")
+    else
+        tor_status=$(systemctl is-active tor@default 2>/dev/null; true)
+        redsocks_status=$(systemctl is-active redsocks 2>/dev/null; true)
+        tor_pct=$(tor_bootstrap_pct 2>/dev/null || echo "?")
+    fi
 
     local rules_ok="no"
     iptables_cmd -t nat -L TELEGRAM_TOR -n &>/dev/null && rules_ok="yes"
 
     local mode="—"
-    [ -f "$CONFIG_FILE" ] && mode=$(grep mode "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "—")
+    [ -f "$CONFIG_FILE" ] && mode=$(grep '^mode=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "—")
 
     clear 2>/dev/null || true
     echo ""
@@ -1868,7 +1877,9 @@ show_menu() {
     [ "$redsocks_status" = "active" ] && redsocks_icon="${GREEN}●${NC}" || redsocks_icon="${RED}●${NC}"
     [ "$rules_ok"        = "yes"   ] && rules_icon="${GREEN}●${NC}" || rules_icon="${RED}●${NC}"
 
-    echo -e "  Tor ${tor_icon} ${tor_pct}% (${mode})   Redsocks ${redsocks_icon}   iptables ${rules_icon}"
+    local inst_label=""
+    [ "$tor_count" -gt 1 ] && inst_label=" ×${tor_count}"
+    echo -e "  Tor ${tor_icon} ${tor_pct}%${inst_label} (${mode})   Redsocks ${redsocks_icon}   iptables ${rules_icon}"
     echo ""
     echo -e "${BOLD}  Выберите действие:${NC}"
     echo ""
