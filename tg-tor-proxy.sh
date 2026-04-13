@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.1.4
+# Version: 2.1.5
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.4"
+readonly VERSION="2.1.5"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1674,24 +1674,30 @@ cmd_update() {
     echo ""
     info "Проверяю версию..."
 
-    local remote_version release_download_url=""
+    local remote_version release_download_url="" wd_download_url="" release_json=""
 
     if [ "$branch" = "main" ]; then
-        # Stable: используем GitHub Releases API — не кешируется, всегда актуально
-        local release_json
+        # Stable: используем /releases/latest — не кешируется CDN
         release_json=$(curl -fsSL --connect-timeout 10 \
             "${api_base}/releases/latest" 2>/dev/null || true)
-        remote_version=$(echo "$release_json" | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || true)
-        # URL для скачивания из релиза
-        release_download_url=$(echo "$release_json" \
-            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-proxy\.sh' | head -1 || true)
     else
-        # Testing: берём из ветки через API contents
-        remote_version=$(curl -fsSL --connect-timeout 10 \
-            -H "Accept: application/vnd.github.raw" \
-            "${api_base}/contents/tg-tor-proxy.sh?ref=${branch}&ts=${ts}" 2>/dev/null \
-            | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"' || true)
+        # Testing: ищем последний pre-release — тоже не кешируется CDN
+        local all_releases
+        all_releases=$(curl -fsSL --connect-timeout 10 \
+            "${api_base}/releases?per_page=10" 2>/dev/null || true)
+        release_json=$(echo "$all_releases" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+pre = [r for r in data if r.get('prerelease')]
+print(json.dumps(pre[0]) if pre else '{}')
+" 2>/dev/null || true)
     fi
+
+    remote_version=$(echo "$release_json" | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || true)
+    release_download_url=$(echo "$release_json" \
+        | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-proxy\.sh' | head -1 || true)
+    wd_download_url=$(echo "$release_json" \
+        | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-watchdog\.sh' | head -1 || true)
 
     if [ -z "$remote_version" ]; then
         warn "Не удалось получить версию с GitHub. Проверьте соединение или название ветки."
@@ -1735,9 +1741,7 @@ cmd_update() {
     fi
 
     info "Скачиваю watchdog..."
-    local wd_dl_url
-    wd_dl_url=$(echo "${release_json:-}" \
-        | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-watchdog\.sh' | head -1 || true)
+    local wd_dl_url="${wd_download_url:-}"
     [ -z "$wd_dl_url" ] && wd_dl_url="${raw_base}/${branch}/tg-tor-watchdog.sh?${ts}"
     if curl -fsSL --connect-timeout 15 "$wd_dl_url" -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-watchdog.sh.new
