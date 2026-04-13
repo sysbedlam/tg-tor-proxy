@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.6"
+readonly VERSION="2.2.7"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1481,20 +1481,40 @@ cmd_diagnose() {
     # ── Live connectivity test ────────────────────────────────────────────
     hdr "Connectivity Tests"
 
-    # Tor working check — get exit IP via check.torproject.org
-    if [ "$pct" = "100" ]; then
-        local tor_ip
-        tor_ip=$(curl -s --connect-timeout 15 \
-            --socks5-hostname "127.0.0.1:$TOR_PORT" \
-            "https://check.torproject.org/api/ip" 2>/dev/null \
-            | grep -oP '"IP":"\K[^"]+' || true)
-        if [ -n "$tor_ip" ]; then
-            echo -e "  Tor SOCKS5: ${GREEN}working${NC} (exit IP: ${tor_ip})"
-        else
-            echo -e "  Tor SOCKS5: ${RED}no response${NC} (Tor bootstrapped but SOCKS5 unreachable)"
-        fi
+    # Tor SOCKS5 check — каждый инстанс отдельно
+    if [ "$tor_instances" -gt 1 ]; then
+        for ((i=0; i<tor_instances; i++)); do
+            local ipct_c tor_ip_c
+            ipct_c=$(tor_bootstrap_pct_inst "$i" 2>/dev/null || echo "0")
+            if [ "$ipct_c" = "100" ]; then
+                tor_ip_c=$(curl -s --connect-timeout 10 \
+                    --socks5-hostname "127.0.0.1:${TOR_PORTS[$i]}" \
+                    "https://check.torproject.org/api/ip" 2>/dev/null \
+                    | grep -oP '"IP":"\K[^"]+' || true)
+                if [ -n "$tor_ip_c" ]; then
+                    echo -e "  Tor SOCKS5 (inst${i} :${TOR_PORTS[$i]}): ${GREEN}working${NC} (exit IP: ${tor_ip_c})"
+                else
+                    echo -e "  Tor SOCKS5 (inst${i} :${TOR_PORTS[$i]}): ${RED}no response${NC}"
+                fi
+            else
+                echo -e "  Tor SOCKS5 (inst${i} :${TOR_PORTS[$i]}): ${YELLOW}not ready${NC} (bootstrap: ${ipct_c}%)"
+            fi
+        done
     else
-        echo -e "  Tor SOCKS5: ${YELLOW}not ready${NC} (bootstrap: ${pct}%)"
+        if [ "$pct" = "100" ]; then
+            local tor_ip
+            tor_ip=$(curl -s --connect-timeout 15 \
+                --socks5-hostname "127.0.0.1:$TOR_PORT" \
+                "https://check.torproject.org/api/ip" 2>/dev/null \
+                | grep -oP '"IP":"\K[^"]+' || true)
+            if [ -n "$tor_ip" ]; then
+                echo -e "  Tor SOCKS5: ${GREEN}working${NC} (exit IP: ${tor_ip})"
+            else
+                echo -e "  Tor SOCKS5: ${RED}no response${NC} (Tor bootstrapped but SOCKS5 unreachable)"
+            fi
+        else
+            echo -e "  Tor SOCKS5: ${YELLOW}not ready${NC} (bootstrap: ${pct}%)"
+        fi
     fi
 
     # iptables interception check
@@ -1506,11 +1526,22 @@ cmd_diagnose() {
         echo -e "  iptables TELEGRAM_TOR: ${RED}missing${NC} — run: tg-tor-proxy --apply-rules"
     fi
 
-    # Redsocks port check
-    if ss -tlnp 2>/dev/null | grep -q ":${REDSOCKS_PORT}"; then
-        echo -e "  Redsocks :${REDSOCKS_PORT}: ${GREEN}listening${NC}"
+    # Redsocks port check — каждый инстанс отдельно
+    if [ "$tor_instances" -gt 1 ]; then
+        for ((i=0; i<tor_instances; i++)); do
+            local rs_port="${RS_PORTS[$i]}"
+            if ss -tlnp 2>/dev/null | grep -q ":${rs_port}"; then
+                echo -e "  Redsocks (inst${i} :${rs_port}): ${GREEN}listening${NC}"
+            else
+                echo -e "  Redsocks (inst${i} :${rs_port}): ${RED}not listening${NC}"
+            fi
+        done
     else
-        echo -e "  Redsocks :${REDSOCKS_PORT}: ${RED}not listening${NC}"
+        if ss -tlnp 2>/dev/null | grep -q ":${REDSOCKS_PORT}"; then
+            echo -e "  Redsocks :${REDSOCKS_PORT}: ${GREEN}listening${NC}"
+        else
+            echo -e "  Redsocks :${REDSOCKS_PORT}: ${RED}not listening${NC}"
+        fi
     fi
 
     # ── Авто-починка ─────────────────────────────────────────────────────
