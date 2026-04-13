@@ -2109,6 +2109,51 @@ interactive_menu() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AUTO-MIGRATE
+# Runs once per version after update — applies config/package changes silently
+# ─────────────────────────────────────────────────────────────────────────────
+auto_migrate() {
+    # Только если уже установлено (конфиг есть)
+    [ -f "$CONFIG_FILE" ] || return 0
+    # Пропускаем если уже мигрировали на эту версию
+    local last_migrated
+    last_migrated=$(grep '^migrated_version=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "")
+    [ "$last_migrated" = "$VERSION" ] && return 0
+
+    # 1. Установить netfilter-persistent если отсутствует
+    if ! dpkg -l netfilter-persistent &>/dev/null 2>&1; then
+        echo iptables-persistent iptables-persistent/autosave_v4 boolean true \
+            | debconf-set-selections 2>/dev/null || true
+        echo iptables-persistent iptables-persistent/autosave_v6 boolean false \
+            | debconf-set-selections 2>/dev/null || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            netfilter-persistent iptables-persistent 2>/dev/null || true
+    fi
+
+    # 2. Добавить user/group в redsocks.conf.inst* если отсутствует
+    for conf in /etc/redsocks.conf.inst*; do
+        [ -f "$conf" ] || continue
+        if ! grep -q 'user = redsocks' "$conf"; then
+            # Вставляем user/group после строки daemon
+            sed -i '/daemon = /a\    user = redsocks;\n    group = redsocks;' "$conf"
+            local _idx="${conf##*inst}"
+            systemctl restart "redsocks-inst${_idx}" 2>/dev/null || true
+        fi
+    done
+
+    # 3. Сохранить iptables правила
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save &>/dev/null || true
+    fi
+
+    # Запомнить что мигрировали на эту версию
+    {
+        grep -v '^migrated_version=' "$CONFIG_FILE" 2>/dev/null || true
+        echo "migrated_version=$VERSION"
+    } > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # When run without args → interactive menu
 # When run with args   → direct command (для CI/скриптов)
@@ -2116,6 +2161,9 @@ interactive_menu() {
 main() {
     local cmd="${1:-}"
     local arg="${2:-}"
+
+    # Auto-apply config migrations for newly installed version
+    auto_migrate
 
     # No arguments → interactive menu
     if [ -z "$cmd" ]; then
