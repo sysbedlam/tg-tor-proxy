@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.9"
+readonly VERSION="2.2.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -2120,30 +2120,48 @@ auto_migrate() {
     last_migrated=$(grep '^migrated_version=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "")
     [ "$last_migrated" = "$VERSION" ] && return 0
 
+    log "Применяю обновление конфигурации v${VERSION}..."
+
     # 1. Установить netfilter-persistent если отсутствует
     if ! dpkg -l netfilter-persistent &>/dev/null 2>&1; then
+        info "Устанавливаю netfilter-persistent..."
         echo iptables-persistent iptables-persistent/autosave_v4 boolean true \
             | debconf-set-selections 2>/dev/null || true
         echo iptables-persistent iptables-persistent/autosave_v6 boolean false \
             | debconf-set-selections 2>/dev/null || true
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            netfilter-persistent iptables-persistent 2>/dev/null || true
+            netfilter-persistent iptables-persistent 2>/dev/null \
+            && log "netfilter-persistent установлен" || warn "Не удалось установить netfilter-persistent"
     fi
 
-    # 2. Добавить user/group в redsocks.conf.inst* если отсутствует
+    # 2. Single-instance redsocks.conf — добавить user/group если отсутствует
+    if [ -f "$REDSOCKS_CONF" ] && ! grep -q 'user = redsocks' "$REDSOCKS_CONF"; then
+        sed -i '/daemon = /a\    user = redsocks;\n    group = redsocks;' "$REDSOCKS_CONF"
+        systemctl restart redsocks 2>/dev/null || true
+        log "redsocks.conf: добавлен user/group, сервис перезапущен"
+    fi
+
+    # 3. Multi-instance redsocks.conf.inst* — добавить user/group если отсутствует
     for conf in /etc/redsocks.conf.inst*; do
         [ -f "$conf" ] || continue
         if ! grep -q 'user = redsocks' "$conf"; then
-            # Вставляем user/group после строки daemon
             sed -i '/daemon = /a\    user = redsocks;\n    group = redsocks;' "$conf"
             local _idx="${conf##*inst}"
             systemctl restart "redsocks-inst${_idx}" 2>/dev/null || true
+            log "${conf}: добавлен user/group, сервис перезапущен"
         fi
     done
 
-    # 3. Сохранить iptables правила
+    # 4. Сохранить iptables правила (переживут ребут)
     if command -v netfilter-persistent &>/dev/null; then
-        netfilter-persistent save &>/dev/null || true
+        netfilter-persistent save &>/dev/null \
+            && log "iptables правила сохранены (persistent)" || true
+    fi
+
+    # 5. Перезапустить watchdog чтобы подхватил новый скрипт
+    if systemctl is-active --quiet tg-tor-watchdog; then
+        systemctl restart tg-tor-watchdog 2>/dev/null \
+            && log "Watchdog перезапущен" || true
     fi
 
     # Запомнить что мигрировали на эту версию
@@ -2151,6 +2169,8 @@ auto_migrate() {
         grep -v '^migrated_version=' "$CONFIG_FILE" 2>/dev/null || true
         echo "migrated_version=$VERSION"
     } > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+    log "Миграция v${VERSION} завершена"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
