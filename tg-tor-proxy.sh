@@ -1119,20 +1119,36 @@ cmd_diagnose() {
     # ── Live connectivity test ────────────────────────────────────────────
     hdr "Connectivity Tests"
 
-    # Direct Telegram (should fail / be DPI'd)
-    local direct_result
-    direct_result=$(curl -s --connect-timeout 5 -o /dev/null -w "%{time_connect}/%{http_code}" \
-        "https://149.154.167.51" -k 2>/dev/null || echo "blocked")
-    echo -e "  Direct Telegram (host→TG): ${direct_result} ${YELLOW}(expected: blocked/timeout)${NC}"
-
-    # Via Tor
+    # Tor working check — get exit IP via check.torproject.org
     if [ "$pct" = "100" ]; then
-        local via_tor
-        via_tor=$(curl -s --connect-timeout 15 \
+        local tor_ip
+        tor_ip=$(curl -s --connect-timeout 15 \
             --socks5-hostname "127.0.0.1:$TOR_PORT" \
-            -o /dev/null -w "%{time_connect}/%{http_code}" \
-            "https://149.154.167.51" -k 2>/dev/null || echo "failed")
-        echo -e "  Via Tor (Tor→TG): ${via_tor}"
+            "https://check.torproject.org/api/ip" 2>/dev/null \
+            | grep -oP '"IP":"\K[^"]+' || true)
+        if [ -n "$tor_ip" ]; then
+            echo -e "  Tor SOCKS5: ${GREEN}working${NC} (exit IP: ${tor_ip})"
+        else
+            echo -e "  Tor SOCKS5: ${RED}no response${NC} (Tor bootstrapped but SOCKS5 unreachable)"
+        fi
+    else
+        echo -e "  Tor SOCKS5: ${YELLOW}not ready${NC} (bootstrap: ${pct}%)"
+    fi
+
+    # iptables interception check
+    local chain_lines
+    chain_lines=$(iptables_cmd -t nat -L TELEGRAM_TOR 2>/dev/null | wc -l || echo 0)
+    if [ "$chain_lines" -gt 5 ]; then
+        echo -e "  iptables TELEGRAM_TOR: ${GREEN}active${NC} (${chain_lines} rules) — VPN client traffic intercepted"
+    else
+        echo -e "  iptables TELEGRAM_TOR: ${RED}missing${NC} — run: tg-tor-proxy --apply-rules"
+    fi
+
+    # Redsocks port check
+    if ss -tlnp 2>/dev/null | grep -q ":${REDSOCKS_PORT}"; then
+        echo -e "  Redsocks :${REDSOCKS_PORT}: ${GREEN}listening${NC}"
+    else
+        echo -e "  Redsocks :${REDSOCKS_PORT}: ${RED}not listening${NC}"
     fi
 
     echo ""
