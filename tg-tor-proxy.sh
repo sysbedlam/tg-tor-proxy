@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 1.6.0
+# Version: 1.7.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="1.6.0"
+readonly VERSION="1.7.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1314,8 +1314,9 @@ cmd_update() {
         *) branch="$current_channel" ;;
     esac
 
-    local script_url="${raw_base}/${branch}/tg-tor-proxy.sh"
-    local watchdog_url="${raw_base}/${branch}/tg-tor-watchdog.sh"
+    local ts; ts=$(date +%s)
+    local script_url="${raw_base}/${branch}/tg-tor-proxy.sh?${ts}"
+    local watchdog_url="${raw_base}/${branch}/tg-tor-watchdog.sh?${ts}"
 
     echo ""
     info "Проверяю версию в ветке '${branch}'..."
