@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.1.7
+# Version: 2.1.8
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.7"
+readonly VERSION="2.1.8"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1045,11 +1045,33 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BLOCK EXTERNAL ACCESS TO REDSOCKS PORTS
+# Вызывается при apply_routes и из пункта 6 меню — независимо от routes-скрипта
+# ─────────────────────────────────────────────────────────────────────────────
+apply_redsocks_protection() {
+    local protected=0
+    for port in "${RS_PORTS[@]}"; do
+        # Проверяем нет ли уже DROP правила для этого порта
+        if iptables_cmd -C INPUT -p tcp --dport "$port" -j DROP &>/dev/null; then
+            continue  # уже защищён
+        fi
+        for net in 127.0.0.0/8 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+            iptables_cmd -C INPUT -p tcp --dport "$port" -s "$net" -j ACCEPT &>/dev/null || \
+            iptables_cmd -I INPUT -p tcp --dport "$port" -s "$net" -j ACCEPT
+        done
+        iptables_cmd -A INPUT -p tcp --dport "$port" -j DROP
+        protected=$((protected + 1))
+    done
+    [ $protected -gt 0 ] && log "Redsocks порты закрыты от внешнего доступа" || true
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # APPLY ROUTES (start iptables)
 # ─────────────────────────────────────────────────────────────────────────────
 apply_routes() {
     bash "$ROUTES_SCRIPT" start
     systemctl start tg-tor-routes 2>/dev/null || true
+    apply_redsocks_protection
     log "iptables rules applied"
 }
 
@@ -1697,24 +1719,53 @@ cmd_update() {
         # Stable: используем /releases/latest — не кешируется CDN
         release_json=$(curl -fsSL --connect-timeout 10 \
             "${api_base}/releases/latest" 2>/dev/null || true)
+        remote_version=$(echo "$release_json" \
+            | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || true)
+        release_download_url=$(echo "$release_json" \
+            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-proxy\.sh' | head -1 || true)
+        wd_download_url=$(echo "$release_json" \
+            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-watchdog\.sh' | head -1 || true)
     else
-        # Testing: ищем последний pre-release — тоже не кешируется CDN
+        # Testing: ищем последний pre-release через Releases API
         local all_releases
         all_releases=$(curl -fsSL --connect-timeout 10 \
             "${api_base}/releases?per_page=10" 2>/dev/null || true)
-        release_json=$(echo "$all_releases" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-pre = [r for r in data if r.get('prerelease')]
-print(json.dumps(pre[0]) if pre else '{}')
-" 2>/dev/null || true)
-    fi
 
-    remote_version=$(echo "$release_json" | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || true)
-    release_download_url=$(echo "$release_json" \
-        | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-proxy\.sh' | head -1 || true)
-    wd_download_url=$(echo "$release_json" \
-        | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-watchdog\.sh' | head -1 || true)
+        # Пробуем python3 для парсинга prerelease объекта
+        if [ -n "$all_releases" ]; then
+            release_json=$(echo "$all_releases" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    pre = [r for r in data if r.get('prerelease')]
+    print(json.dumps(pre[0]) if pre else '{}')
+except: print('{}')
+" 2>/dev/null) || release_json="{}"
+        fi
+
+        remote_version=$(echo "$release_json" \
+            | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1 || true)
+        release_download_url=$(echo "$release_json" \
+            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-proxy\.sh' | head -1 || true)
+        wd_download_url=$(echo "$release_json" \
+            | grep -oP '"browser_download_url":\s*"\K[^"]+tg-tor-watchdog\.sh' | head -1 || true)
+
+        # Фолбэк: если API не дал версию — читаем из файла в ветке (CDN)
+        if [ -z "$remote_version" ]; then
+            info "Releases API недоступен, пробую contents API..."
+            local ts; ts=$(date +%s)
+            remote_version=$(curl -fsSL --connect-timeout 10 \
+                -H "Accept: application/vnd.github.raw" \
+                "${api_base}/contents/tg-tor-proxy.sh?ref=${branch}&ts=${ts}" 2>/dev/null \
+                | grep -m1 '^readonly VERSION=' \
+                | grep -oP '"[^"]+"' | tr -d '"' || true)
+            # Конструируем URL из версии (release assets не кешируются CDN)
+            if [ -n "$remote_version" ]; then
+                release_download_url="https://github.com/${gh_repo}/releases/download/v${remote_version}/tg-tor-proxy.sh"
+                wd_download_url="https://github.com/${gh_repo}/releases/download/v${remote_version}/tg-tor-watchdog.sh"
+            fi
+        fi
+    fi
 
     if [ -z "$remote_version" ]; then
         warn "Не удалось получить версию с GitHub. Проверьте соединение или название ветки."
@@ -1993,6 +2044,7 @@ interactive_menu() {
                     warn "Скрипт правил не найден: $ROUTES_SCRIPT"
                     warn "Запустите установку (пункт 1)"
                 fi
+                apply_redsocks_protection
                 echo ""
                 read -rp "  Нажмите Enter для возврата в меню..." _dummy
                 ;;
