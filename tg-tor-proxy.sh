@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.2"
+readonly VERSION="2.2.3"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -345,7 +345,7 @@ configure_tor_instance() {
         echo "MaxClientCircuitsPending 128"
         echo "KeepalivePeriod 30"
         echo "# Latency optimizations"
-        echo "OptimisticData 1"
+        echo "## OptimisticData removed (obsolete in Tor >= 0.4.x)"
         echo "CircuitStreamTimeout 15"
         if [ "$mode" = "bridges" ] && [ -f "$bridges_file" ]; then
             grep -q "^Bridge obfs4" "$bridges_file" && \
@@ -449,7 +449,7 @@ NewCircuitPeriod 15
 MaxClientCircuitsPending 128
 KeepalivePeriod 30
 # Latency optimizations
-OptimisticData 1
+## OptimisticData removed (obsolete in Tor >= 0.4.x)
 CircuitStreamTimeout 15
 TOREOF
     systemctl restart tor@default 2>/dev/null || systemctl restart tor
@@ -494,7 +494,7 @@ configure_tor_bridges() {
         echo "MaxClientCircuitsPending 128"
         echo "KeepalivePeriod 30"
         echo "# Latency optimizations"
-        echo "OptimisticData 1"
+        echo "## OptimisticData removed (obsolete in Tor >= 0.4.x)"
         echo "CircuitStreamTimeout 15"
     } > "$TORRC"
 
@@ -1863,45 +1863,77 @@ except: print('{}')
 
 cmd_check_tor() {
     require_root
-    hdr "Checking Tor connectivity"
+    hdr "Проверка Tor"
 
-    local pct
-    pct=$(tor_bootstrap_pct 2>/dev/null || echo "0")
-    echo -e "Current bootstrap: ${BOLD}${pct}%${NC}"
+    local tor_count
+    tor_count=$(get_tor_instances)
 
-    if [ "$pct" != "100" ]; then
-        warn "Tor not at 100%. Current state:"
-        journalctl -u tor@default --no-pager -n 10 2>/dev/null | \
-            grep -E 'Bootstrap|warn|error' | tail -5 || true
-
-        echo ""
-        read -rp "Try to force bootstrap via SIGHUP? [Y/n]: " ans
-        ans=${ans:-Y}
-        if [[ "${ans^^}" == "Y" ]]; then
-            local tor_pid
-            tor_pid=$(systemctl show tor@default --property=MainPID --value 2>/dev/null || echo "0")
-            [ "$tor_pid" != "0" ] && kill -HUP "$tor_pid" 2>/dev/null && info "SIGHUP sent"
-            wait_tor_bootstrap 60 999 false
-            pct=$(tor_bootstrap_pct 2>/dev/null || echo "0")
-        fi
-    fi
-
-    if [ "$pct" = "100" ]; then
-        local tor_ip
-        tor_ip=$(curl -s --connect-timeout 15 \
-            --socks5-hostname "127.0.0.1:$TOR_PORT" \
-            https://check.torproject.org/api/ip 2>/dev/null \
-            | grep -oP '"IP":"\K[^"]+' || echo "failed")
-        if [ "$tor_ip" != "failed" ] && [ -n "$tor_ip" ]; then
-            log "Tor is working! Exit IP: ${BOLD}$tor_ip${NC}"
-        else
-            err "Tor at 100% but SOCKS5 proxy not responding"
-        fi
+    if [ "$tor_count" -gt 1 ]; then
+        # Multi-instance: проверяем каждый инстанс
+        local all_ok=true
+        for ((i=0; i<tor_count; i++)); do
+            local pct svc port
+            svc="tg-tor-inst${i}"
+            port="${TOR_PORTS[$i]}"
+            pct=$(tor_bootstrap_pct_inst "$i" 2>/dev/null || echo "0")
+            echo -e "  [inst${i}] Bootstrap: ${BOLD}${pct}%${NC}"
+            if [ "$pct" != "100" ]; then
+                all_ok=false
+                warn "[inst${i}] Tor не на 100%. Последние логи:"
+                journalctl -u "$svc" --no-pager -n 5 2>/dev/null | \
+                    grep -E 'Bootstrap|warn|error' | tail -3 || true
+                echo ""
+                read -rp "  SIGHUP для inst${i}? [Y/n]: " ans
+                ans=${ans:-Y}
+                if [[ "${ans^^}" == "Y" ]]; then
+                    local tor_pid
+                    tor_pid=$(systemctl show "$svc" --property=MainPID --value 2>/dev/null || echo "0")
+                    [ "$tor_pid" != "0" ] && kill -HUP "$tor_pid" 2>/dev/null && info "SIGHUP отправлен"
+                fi
+            else
+                local tor_ip
+                tor_ip=$(curl -s --connect-timeout 10 \
+                    --socks5-hostname "127.0.0.1:${port}" \
+                    https://check.torproject.org/api/ip 2>/dev/null \
+                    | grep -oP '"IP":"\K[^"]+' || echo "")
+                [ -n "$tor_ip" ] && log "[inst${i}] Работает! Exit IP: ${BOLD}${tor_ip}${NC}" || \
+                    warn "[inst${i}] 100% но SOCKS5 не отвечает"
+            fi
+        done
     else
-        err "Tor bootstrap failed (at ${pct}%)"
-        echo ""
-        echo "If Tor is consistently blocked, add obfs4 bridges:"
-        echo -e "  ${CYAN}$0 --add-bridges${NC}"
+        # Single instance
+        local pct
+        pct=$(tor_bootstrap_pct 2>/dev/null || echo "0")
+        echo -e "  Bootstrap: ${BOLD}${pct}%${NC}"
+
+        if [ "$pct" != "100" ]; then
+            warn "Tor не на 100%. Последние логи:"
+            journalctl -u tor@default --no-pager -n 10 2>/dev/null | \
+                grep -E 'Bootstrap|warn|error' | tail -5 || true
+            echo ""
+            read -rp "  SIGHUP? [Y/n]: " ans
+            ans=${ans:-Y}
+            if [[ "${ans^^}" == "Y" ]]; then
+                local tor_pid
+                tor_pid=$(systemctl show tor@default --property=MainPID --value 2>/dev/null || echo "0")
+                [ "$tor_pid" != "0" ] && kill -HUP "$tor_pid" 2>/dev/null && info "SIGHUP отправлен"
+                wait_tor_bootstrap 60 999 false
+                pct=$(tor_bootstrap_pct 2>/dev/null || echo "0")
+            fi
+        fi
+
+        if [ "$pct" = "100" ]; then
+            local tor_ip
+            tor_ip=$(curl -s --connect-timeout 15 \
+                --socks5-hostname "127.0.0.1:$TOR_PORT" \
+                https://check.torproject.org/api/ip 2>/dev/null \
+                | grep -oP '"IP":"\K[^"]+' || echo "")
+            [ -n "$tor_ip" ] && log "Работает! Exit IP: ${BOLD}${tor_ip}${NC}" || \
+                err "Tor на 100% но SOCKS5 не отвечает"
+        else
+            err "Tor bootstrap failed (${pct}%)"
+            echo -e "  Добавьте obfs4 мосты: ${CYAN}tg-tor-proxy --add-bridges${NC}"
+        fi
     fi
 }
 
@@ -2174,14 +2206,15 @@ auto_migrate() {
             && log "iptables правила сохранены (persistent)" || true
     fi
 
-    # 5. Добавить OptimisticData + CircuitStreamTimeout в torrc если отсутствуют
-    #    и снизить CircuitBuildTimeout с 60 до 30
+    # 5. Обновить torrc: убрать устаревший OptimisticData, добавить CircuitStreamTimeout,
+    #    снизить CircuitBuildTimeout с 60 до 30
     local tor_changed=false
     for torrc_f in "$TORRC" /etc/tor/torrc.inst*; do
         [ -f "$torrc_f" ] || continue
         local changed_f=false
-        if ! grep -q 'OptimisticData' "$torrc_f"; then
-            echo "OptimisticData 1" >> "$torrc_f"
+        # Убираем OptimisticData если есть (obsolete в Tor >= 0.4.x, вызывает warn)
+        if grep -q 'OptimisticData' "$torrc_f"; then
+            sed -i '/OptimisticData/d' "$torrc_f"
             changed_f=true
         fi
         if ! grep -q 'CircuitStreamTimeout' "$torrc_f"; then
@@ -2196,7 +2229,7 @@ auto_migrate() {
         $changed_f && tor_changed=true
     done
     if $tor_changed; then
-        log "Tor: применены оптимизации латентности (OptimisticData, CircuitStreamTimeout)"
+        log "Tor: применены оптимизации латентности (CircuitStreamTimeout, CircuitBuildTimeout 30)"
         systemctl reload-or-restart tor@default 2>/dev/null || true
         for i in 0 1 2; do
             systemctl is-active --quiet "tg-tor-inst${i}" 2>/dev/null && \
