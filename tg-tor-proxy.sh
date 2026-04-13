@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 1.4.0
+# Version: 1.5.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="1.4.0"
+readonly VERSION="1.5.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1238,11 +1238,11 @@ cmd_update() {
     # Get remote version
     local remote_version
     remote_version=$(curl -fsSL --connect-timeout 10 "$script_url" 2>/dev/null \
-        | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"')
+        | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"' || true)
 
     if [ -z "$remote_version" ]; then
-        err "Не удалось получить версию с GitHub. Проверьте интернет-соединение."
-        return 1
+        warn "Не удалось получить версию с GitHub. Проверьте интернет-соединение."
+        return 0
     fi
 
     echo -e "  Текущая версия:  ${BOLD}v${VERSION}${NC}"
