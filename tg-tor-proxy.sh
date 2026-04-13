@@ -711,65 +711,47 @@ ExecStop=/bin/bash -c 'systemctl stop tg-tor-routes.service'
 WantedBy=multi-user.target
 EOF
 
-    # Persistent watchdog script
-    cat > /usr/local/bin/tg-tor-watchdog.sh << 'WDEOF'
-#!/bin/bash
-# Persistent watchdog for tg-tor-proxy — restarts Tor/redsocks if they fail
-COOKIE="/run/tor/control.authcookie"
-CONTROL="/run/tor/control"
-LOG_TAG="tg-tor-watchdog"
-log() { logger -t "$LOG_TAG" "$*"; echo "$(date '+%H:%M:%S') $*"; }
-
-get_pct() {
-    python3 -c "
-import socket, re
-try:
-    with open('$COOKIE','rb') as f: c=f.read().hex()
-    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-    s.settimeout(3); s.connect('$CONTROL')
-    s.send(f'AUTHENTICATE {c}\r\n'.encode()); s.recv(200)
-    s.send(b'GETINFO status/bootstrap-phase\r\n')
-    r=s.recv(500).decode(); s.close()
-    m=re.search(r'PROGRESS=(\d+)',r); print(m.group(1) if m else '-1')
-except: print('-1')
-" 2>/dev/null || echo -1
-}
-
-sighup_tor() {
-    local pid
-    pid=$(systemctl show tor@default --property=MainPID --value 2>/dev/null || echo 0)
-    [ "$pid" != "0" ] && kill -HUP "$pid" 2>/dev/null && \
-        log "SIGHUP sent to Tor (PID $pid) — pausing 15s" && sleep 15
-}
-
-STUCK=0; LAST=-1; TICKS100=0; FAILS=0
-log "Watchdog started"
-while true; do
-    sleep 10
-    pct=$(get_pct)
-    if [ "$pct" -eq -1 ]; then
-        FAILS=$((FAILS+1))
-        [ $FAILS -ge 3 ] && ! systemctl is-active --quiet tor@default && \
-            log "Tor down — restarting..." && systemctl restart tor@default && sleep 20 && FAILS=0 LAST=-1 STUCK=0
-        continue
-    fi
-    FAILS=0
-    if [ "$pct" -eq 100 ]; then
-        TICKS100=$((TICKS100+1)); STUCK=0; LAST=100
-        ! systemctl is-active --quiet redsocks && \
-            log "Redsocks down — restarting..." && systemctl restart redsocks
-        journalctl -u redsocks --since "30 seconds ago" --no-pager -q 2>/dev/null | grep -q "backing off" && \
-            log "Redsocks fd exhaustion — restarting..." && systemctl restart redsocks
-        [ $((TICKS100 % 60)) -eq 0 ] && [ $TICKS100 -gt 0 ] && \
-            log "Periodic circuit refresh" && sighup_tor
+    # Persistent watchdog script — download from GitHub
+    local wd_url="https://raw.githubusercontent.com/sysbedlam/tg-tor-proxy/main/tg-tor-watchdog.sh"
+    if curl -fsSL --connect-timeout 10 "$wd_url" -o /usr/local/bin/tg-tor-watchdog.sh 2>/dev/null; then
+        log "Watchdog script downloaded"
     else
-        log "Tor bootstrap: ${pct}%"; TICKS100=0
-        [ "$pct" -eq "$LAST" ] && STUCK=$((STUCK+1)) || { STUCK=0; LAST=$pct; }
-        [ $STUCK -eq 3 ] && { log "Stuck at ${pct}% for 30s — SIGHUP"; sighup_tor; STUCK=0; }
-        [ $STUCK -ge 12 ] && { log "Stuck $((STUCK*10))s — restarting Tor"; systemctl restart tor@default; sleep 20; STUCK=0; LAST=-1; }
-    fi
-done
+        warn "Could not download watchdog from GitHub, using bundled version"
+        cat > /usr/local/bin/tg-tor-watchdog.sh << 'WDEOF'
+#!/bin/bash
+COOKIE="/run/tor/control.authcookie"; CONTROL="/run/tor/control"; LOG_TAG="tg-tor-watchdog"
+log() { logger -t "$LOG_TAG" "$*"; echo "$(date '+%H:%M:%S') $*"; }
+get_pct() { python3 -c "
+import socket,re
+try:
+ with open('$COOKIE','rb') as f: c=f.read().hex()
+ s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(3); s.connect('$CONTROL')
+ s.send(f'AUTHENTICATE {c}\r\n'.encode()); s.recv(200)
+ s.send(b'GETINFO status/bootstrap-phase\r\n'); r=s.recv(500).decode(); s.close()
+ m=re.search(r'PROGRESS=(\d+)',r); print(m.group(1) if m else '-1')
+except: print('-1')
+" 2>/dev/null || echo -1; }
+sighup_tor() { local p; p=$(systemctl show tor@default --property=MainPID --value 2>/dev/null||echo 0)
+ [ "$p" != "0" ] && kill -HUP "$p" 2>/dev/null && log "SIGHUP sent" && sleep 15; }
+STUCK=0; LAST=-1; FAILS=0; RSCOOL=0
+log "Watchdog started"
+while true; do sleep 10; pct=$(get_pct)
+ if [ "$pct" -eq -1 ]; then FAILS=$((FAILS+1))
+  [ $FAILS -ge 3 ] && ! systemctl is-active --quiet tor@default && \
+   log "Tor down — restarting" && systemctl restart tor@default && sleep 20 && FAILS=0 && LAST=-1 && STUCK=0
+  continue; fi; FAILS=0
+ if [ "$pct" -eq 100 ]; then STUCK=0; LAST=100
+  ! systemctl is-active --quiet redsocks && log "Redsocks down" && systemctl restart redsocks && RSCOOL=6
+  if [ "$RSCOOL" -gt 0 ]; then RSCOOL=$((RSCOOL-1))
+  elif journalctl -u redsocks --since "30 seconds ago" --no-pager -q 2>/dev/null | grep -q "backing off"; then
+   log "Redsocks fd exhaustion" && systemctl restart redsocks && RSCOOL=6; fi
+ else log "Tor bootstrap: ${pct}%"
+  [ "$pct" -eq "$LAST" ] && STUCK=$((STUCK+1)) || { STUCK=0; LAST=$pct; }
+  [ $STUCK -eq 3 ] && { log "Stuck at ${pct}% — SIGHUP"; sighup_tor; STUCK=0; }
+  [ $STUCK -ge 12 ] && { log "Stuck — restarting Tor"; systemctl restart tor@default; sleep 20; STUCK=0; LAST=-1; }
+ fi; done
 WDEOF
+    fi
     chmod +x /usr/local/bin/tg-tor-watchdog.sh
 
     # Watchdog service
