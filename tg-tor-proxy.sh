@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 1.5.0
+# Version: 1.6.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="1.5.0"
+readonly VERSION="1.6.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1133,12 +1133,69 @@ cmd_diagnose() {
         echo -e "  Redsocks :${REDSOCKS_PORT}: ${RED}not listening${NC}"
     fi
 
+    # ── Авто-починка ─────────────────────────────────────────────────────
+    local fixes=()
+
+    # Собираем список проблем
+    if ! systemctl is-active --quiet redsocks 2>/dev/null; then
+        fixes+=("redsocks")
+    fi
+    if ! systemctl is-active --quiet tor@default 2>/dev/null; then
+        fixes+=("tor")
+    fi
+    local chain_fix
+    chain_fix=$(iptables_cmd -t nat -L TELEGRAM_TOR 2>/dev/null | wc -l || echo 0)
+    if [ "$chain_fix" -le 5 ]; then
+        fixes+=("iptables")
+    fi
+    if ! systemctl is-active --quiet tg-tor-watchdog 2>/dev/null; then
+        fixes+=("watchdog")
+    fi
+
+    if [ ${#fixes[@]} -gt 0 ]; then
+        echo ""
+        echo -e "${YELLOW}${BOLD}  Обнаружены проблемы: ${fixes[*]}${NC}"
+        read -rp "  Исправить автоматически? [Y/n]: " autofix
+        if [[ "${autofix,,}" != "n" ]]; then
+            echo ""
+            for fix in "${fixes[@]}"; do
+                case "$fix" in
+                    redsocks)
+                        info "Запускаю redsocks..."
+                        systemctl restart redsocks && log "redsocks запущен" || warn "Не удалось запустить redsocks"
+                        ;;
+                    tor)
+                        info "Запускаю tor@default..."
+                        systemctl restart tor@default && log "Tor запущен" || warn "Не удалось запустить Tor"
+                        ;;
+                    iptables)
+                        info "Применяю iptables правила..."
+                        if [ -x "$ROUTES_SCRIPT" ]; then
+                            bash "$ROUTES_SCRIPT" stop 2>/dev/null || true
+                            bash "$ROUTES_SCRIPT" start && log "iptables правила применены" || warn "Ошибка применения правил"
+                        else
+                            warn "Скрипт правил не найден — запустите установку (пункт 1)"
+                        fi
+                        ;;
+                    watchdog)
+                        info "Запускаю watchdog..."
+                        systemctl restart tg-tor-watchdog && log "Watchdog запущен" || warn "Не удалось запустить watchdog"
+                        ;;
+                esac
+            done
+            echo ""
+            log "Авто-починка завершена. Запустите диагностику повторно для проверки."
+        fi
+    else
+        echo ""
+        echo -e "  ${GREEN}${BOLD}Проблем не обнаружено — всё работает.${NC}"
+    fi
+
     echo ""
-    echo -e "${BOLD}Useful commands:${NC}"
+    echo -e "${BOLD}Команды для мониторинга:${NC}"
     echo -e "  journalctl -t redsocks -f          — live session log"
     echo -e "  journalctl -u tor@default -f       — Tor log"
-    echo -e "  $0 --add-bridges                   — update bridges"
-    echo -e "  $0 --check-tor                     — retest Tor"
+    echo -e "  journalctl -u tg-tor-watchdog -f   — watchdog log"
     echo ""
 }
 
@@ -1229,60 +1286,95 @@ cmd_add_bridges_file() {
 cmd_update() {
     require_root
 
-    local raw_base="https://raw.githubusercontent.com/sysbedlam/tg-tor-proxy/main"
-    local script_url="$raw_base/tg-tor-proxy.sh"
-    local watchdog_url="$raw_base/tg-tor-watchdog.sh"
+    local gh_repo="sysbedlam/tg-tor-proxy"
+    local raw_base="https://raw.githubusercontent.com/${gh_repo}"
 
-    hdr "Проверка обновлений"
+    hdr "Обновление tg-tor-proxy"
 
-    # Get remote version
+    # Текущий канал из конфига
+    local current_channel
+    current_channel=$(grep '^channel=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "main")
+    [ -z "$current_channel" ] && current_channel="main"
+
+    echo -e "  Текущая версия:  ${BOLD}v${VERSION}${NC}"
+    echo -e "  Канал:           ${BOLD}${current_channel}${NC}"
+    echo ""
+    echo -e "  Выберите канал обновления:"
+    echo -e "  ${CYAN}1)${NC} stable  (main)                        — стабильная версия"
+    echo -e "  ${CYAN}2)${NC} testing (fix/direct-mode-stability)   — тестовая ветка"
+    echo -e "  ${CYAN}3)${NC} Оставить текущий канал (${current_channel})"
+    echo ""
+    read -rp "  Ваш выбор [1-3]: " ch_choice
+
+    local branch
+    case "$ch_choice" in
+        1) branch="main" ;;
+        2) branch="fix/direct-mode-stability" ;;
+        3) branch="$current_channel" ;;
+        *) branch="$current_channel" ;;
+    esac
+
+    local script_url="${raw_base}/${branch}/tg-tor-proxy.sh"
+    local watchdog_url="${raw_base}/${branch}/tg-tor-watchdog.sh"
+
+    echo ""
+    info "Проверяю версию в ветке '${branch}'..."
+
     local remote_version
     remote_version=$(curl -fsSL --connect-timeout 10 "$script_url" 2>/dev/null \
         | grep -m1 '^readonly VERSION=' | grep -oP '"[^"]+"' | tr -d '"' || true)
 
     if [ -z "$remote_version" ]; then
-        warn "Не удалось получить версию с GitHub. Проверьте интернет-соединение."
+        warn "Не удалось получить версию с GitHub. Проверьте соединение или название ветки."
         return 0
     fi
 
-    echo -e "  Текущая версия:  ${BOLD}v${VERSION}${NC}"
-    echo -e "  Версия GitHub:   ${BOLD}v${remote_version}${NC}"
+    echo -e "  Версия в ветке '${branch}': ${BOLD}v${remote_version}${NC}"
     echo ""
 
-    if [ "$remote_version" = "$VERSION" ]; then
-        log "Уже установлена последняя версия."
+    if [ "$remote_version" = "$VERSION" ] && [ "$branch" = "$current_channel" ]; then
+        log "Уже установлена последняя версия (v${VERSION}) из канала '${branch}'."
         return 0
     fi
 
-    echo -e "  ${GREEN}Доступно обновление: v${VERSION} → v${remote_version}${NC}"
+    if [ "$branch" != "$current_channel" ]; then
+        echo -e "  ${YELLOW}Смена канала: '${current_channel}' → '${branch}'${NC}"
+    fi
+    if [ "$remote_version" != "$VERSION" ]; then
+        echo -e "  ${GREEN}Обновление: v${VERSION} → v${remote_version}${NC}"
+    fi
     echo ""
-    read -rp "  Обновить? [Y/n]: " confirm
+    read -rp "  Продолжить? [Y/n]: " confirm
     [[ "${confirm,,}" == "n" ]] && { info "Отменено."; return 0; }
 
     echo ""
-    info "Скачиваю tg-tor-proxy v${remote_version}..."
-    if curl -fsSL --connect-timeout 15 "$script_url" -o /usr/local/bin/tg-tor-proxy.new; then
+    info "Скачиваю tg-tor-proxy..."
+    if curl -fsSL --connect-timeout 15 "$script_url" -o /usr/local/bin/tg-tor-proxy.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-proxy.new
         mv /usr/local/bin/tg-tor-proxy.new /usr/local/bin/tg-tor-proxy
+        # Сохраняем выбранный канал
+        mkdir -p "$CONFIG_DIR"
+        grep -v '^channel=' "$CONFIG_FILE" 2>/dev/null > "${CONFIG_FILE}.tmp" || true
+        echo "channel=${branch}" >> "${CONFIG_FILE}.tmp"
+        mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
         log "Основной скрипт обновлён"
     else
-        err "Ошибка при скачивании скрипта"
-        return 1
+        warn "Ошибка при скачивании скрипта"
+        return 0
     fi
 
     info "Скачиваю watchdog..."
-    if curl -fsSL --connect-timeout 15 "$watchdog_url" -o /usr/local/bin/tg-tor-watchdog.sh.new; then
+    if curl -fsSL --connect-timeout 15 "$watchdog_url" -o /usr/local/bin/tg-tor-watchdog.sh.new 2>/dev/null; then
         chmod +x /usr/local/bin/tg-tor-watchdog.sh.new
         mv /usr/local/bin/tg-tor-watchdog.sh.new /usr/local/bin/tg-tor-watchdog.sh
         systemctl restart tg-tor-watchdog 2>/dev/null || true
         log "Watchdog обновлён и перезапущен"
     else
-        warn "Не удалось обновить watchdog (основной скрипт обновлён)"
+        warn "Watchdog не обновлён (основной скрипт обновлён)"
     fi
 
     echo ""
-    log "Обновление завершено: v${VERSION} → v${remote_version}"
-    info "Перезапустите tg-tor-proxy для применения изменений"
+    log "Готово! Перезапустите tg-tor-proxy чтобы увидеть новую версию."
 }
 
 cmd_check_tor() {
