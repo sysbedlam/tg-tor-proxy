@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.8"
+readonly VERSION="2.1.9"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -244,14 +244,29 @@ install_packages() {
     command -v tor      &>/dev/null || pkgs+=(tor)
     command -v redsocks &>/dev/null || pkgs+=(redsocks)
     command -v obfs4proxy &>/dev/null || pkgs+=(obfs4proxy)
+    # iptables-persistent — сохраняет правила iptables между перезагрузками
+    dpkg -l netfilter-persistent &>/dev/null || pkgs+=(netfilter-persistent iptables-persistent)
 
     if [ ${#pkgs[@]} -gt 0 ]; then
         info "Installing: ${pkgs[*]}"
         apt-get update -qq 2>/dev/null
+        # Предотвращаем интерактивный диалог iptables-persistent
+        echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections 2>/dev/null || true
+        echo iptables-persistent iptables-persistent/autosave_v6 boolean false | debconf-set-selections 2>/dev/null || true
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${pkgs[@]}" 2>/dev/null
         log "Packages installed"
     else
         log "All packages already installed"
+    fi
+}
+
+save_iptables_rules() {
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save &>/dev/null || true
+    elif command -v iptables-save &>/dev/null; then
+        local savefile="/etc/iptables/rules.v4"
+        mkdir -p /etc/iptables
+        iptables-save > "$savefile" || true
     fi
 }
 
@@ -364,6 +379,8 @@ base {
     log_info = on;
     log = "syslog:daemon";
     daemon = off;
+    user = redsocks;
+    group = redsocks;
     redirector = iptables;
 }
 redsocks {
@@ -1072,6 +1089,7 @@ apply_routes() {
     bash "$ROUTES_SCRIPT" start
     systemctl start tg-tor-routes 2>/dev/null || true
     apply_redsocks_protection
+    save_iptables_rules
     log "iptables rules applied"
 }
 
@@ -1565,7 +1583,8 @@ cmd_diagnose() {
                         info "Применяю iptables правила..."
                         if [ -x "$ROUTES_SCRIPT" ]; then
                             bash "$ROUTES_SCRIPT" stop 2>/dev/null || true
-                            bash "$ROUTES_SCRIPT" start && log "iptables правила применены" || warn "Ошибка"
+                            bash "$ROUTES_SCRIPT" start && \
+                                { apply_redsocks_protection; save_iptables_rules; log "iptables правила применены"; } || warn "Ошибка"
                         else
                             warn "Скрипт правил не найден — запустите установку (пункт 1)"
                         fi
@@ -2045,6 +2064,7 @@ interactive_menu() {
                     warn "Запустите установку (пункт 1)"
                 fi
                 apply_redsocks_protection
+                save_iptables_rules
                 echo ""
                 read -rp "  Нажмите Enter для возврата в меню..." _dummy
                 ;;
@@ -2128,6 +2148,8 @@ main() {
             require_root
             [ -x "$ROUTES_SCRIPT" ] || die "Скрипт правил не найден. Запустите установку."
             bash "$ROUTES_SCRIPT" stop 2>/dev/null; bash "$ROUTES_SCRIPT" start
+            apply_redsocks_protection
+            save_iptables_rules
             ;;
         --update|-u)
             require_root; cmd_update
