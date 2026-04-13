@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.1.1
+# Version: 2.1.2
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.1.1"
+readonly VERSION="2.1.2"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
