@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.3.0
+# Version: 2.3.1
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.3.0"
+readonly VERSION="2.3.1"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1005,7 +1005,7 @@ WDEOF
 
     # Watchdog service
     local wd_after wd_wants
-    if [ "$tor_count_now" -gt 1 ]; then
+    if [ "$tor_count_arg" -gt 1 ]; then
         wd_after="tg-tor-inst0.service"
         wd_wants="tg-tor-inst0.service"
     else
@@ -1395,7 +1395,12 @@ cmd_enable() {
     local tor_count
     tor_count=$(get_tor_instances)
 
-    # Запустить Tor + Redsocks
+    local mode
+    mode=$(grep '^mode=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 || echo "direct")
+    local use_bridges=false
+    [ "$mode" = "bridges" ] && use_bridges=true
+
+    # 1. Запустить Tor + Redsocks
     if [ "$tor_count" -gt 1 ]; then
         for ((i=0; i<tor_count; i++)); do
             systemctl enable "tg-tor-inst${i}" 2>/dev/null || true
@@ -1410,13 +1415,44 @@ cmd_enable() {
         systemctl start redsocks 2>/dev/null || true
     fi
 
-    # Запустить основные сервисы
-    for svc in tg-tor-bootstrap tg-tor-proxy tg-tor-watchdog; do
-        systemctl enable "$svc" 2>/dev/null || true
-        systemctl start "$svc" 2>/dev/null || true
-    done
+    # 2. Ждём bootstrap Tor
+    local boot_timeout stuck_threshold
+    if $use_bridges; then
+        boot_timeout=$BRIDGE_BOOTSTRAP_TIMEOUT
+        stuck_threshold=999
+    else
+        boot_timeout=$DIRECT_BOOTSTRAP_TIMEOUT
+        stuck_threshold=$DIRECT_STUCK_THRESHOLD
+    fi
 
-    # Применить iptables правила
+    local boot_ok=false
+    if [ "$tor_count" -gt 1 ]; then
+        # Multi: ждём только инстанс 0 (остальные поднимутся параллельно)
+        info "Ожидаю bootstrap инстанса 0 (max ${boot_timeout}s)..."
+        local elapsed=0 pct=0
+        while [ $elapsed -lt $boot_timeout ]; do
+            pct=$(tor_bootstrap_pct_inst 0 2>/dev/null || echo "0")
+            pct=${pct:-0}
+            local filled=$(( pct * 30 / 100 ))
+            local empty=$(( 30 - filled ))
+            printf "\r  [inst0] [%s%s] %d%% (%ds)" \
+                "$(printf '█%.0s' $(seq 1 $filled 2>/dev/null) 2>/dev/null || head -c $filled /dev/urandom | tr -dc '' | cat -v | tr -d ' ' || printf '%0.s█' $(seq 1 $filled))" \
+                "$(printf '░%.0s' $(seq 1 $empty 2>/dev/null) 2>/dev/null || printf '%0.s░' $(seq 1 $empty))" \
+                "$pct" "$elapsed"
+            [ "$pct" -eq 100 ] && { echo ""; log "Инстанс 0 загрузился!"; boot_ok=true; break; }
+            sleep 5; elapsed=$((elapsed+5))
+        done
+        echo ""
+        $boot_ok || warn "Bootstrap timeout инстанса 0 — Tor может подняться в фоне"
+    else
+        if wait_tor_bootstrap "$boot_timeout" "$stuck_threshold" "$use_bridges" "$BRIDGE_STUCK_SIGHUP"; then
+            boot_ok=true
+        else
+            warn "Bootstrap timeout — Tor может подняться в фоне"
+        fi
+    fi
+
+    # 3. Применить iptables правила
     if [ -x "$ROUTES_SCRIPT" ]; then
         bash "$ROUTES_SCRIPT" start
         apply_redsocks_protection
@@ -1426,11 +1462,22 @@ cmd_enable() {
         warn "Скрипт правил не найден — запустите установку (пункт 1)"
     fi
 
-    # Снять флаг disabled
+    # 4. Запустить watchdog и прочие сервисы
+    for svc in tg-tor-proxy tg-tor-watchdog; do
+        systemctl enable "$svc" 2>/dev/null || true
+        systemctl start "$svc" 2>/dev/null || true
+    done
+
+    # 5. Снять флаг disabled
     sed -i '/^disabled=/d' "$CONFIG_FILE"
 
-    log "tg-tor-proxy включён. Telegram идёт через Tor."
-    info "Проверьте статус: tg-tor-proxy --diagnose"
+    echo ""
+    if $boot_ok; then
+        log "tg-tor-proxy включён. Telegram идёт через Tor."
+    else
+        warn "tg-tor-proxy включён, но Tor ещё не завершил bootstrap."
+        info "Проверьте через минуту: tg-tor-proxy --diagnose"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
