@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.1.8
+# Version: 2.3.0
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -12,12 +12,14 @@
 #   ./tg-tor-proxy.sh --add-bridges      — interactively add/replace bridges
 #   ./tg-tor-proxy.sh --add-bridges "obfs4 1.2.3.4:1234 FP cert=... iat-mode=0"
 #   ./tg-tor-proxy.sh --add-bridges-file /path/to/bridges.txt
+#   ./tg-tor-proxy.sh --disable          — stop all services, keep config
+#   ./tg-tor-proxy.sh --enable           — re-enable after --disable
 # =============================================================================
 
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.2.7"
+readonly VERSION="2.3.0"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1314,6 +1316,124 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DISABLE / ENABLE  (без удаления — только остановить/запустить)
+# ─────────────────────────────────────────────────────────────────────────────
+is_disabled() {
+    grep -q '^disabled=1' "$CONFIG_FILE" 2>/dev/null
+}
+
+cmd_disable() {
+    require_root
+    [ -f "$CONFIG_FILE" ] || die "tg-tor-proxy не установлен. Сначала выполните установку (пункт 1)."
+    if is_disabled; then
+        warn "Приложение уже отключено."
+        return 0
+    fi
+
+    hdr "Отключение tg-tor-proxy"
+
+    local tor_count
+    tor_count=$(get_tor_instances)
+
+    # Остановить watchdog первым, чтобы не мешал
+    systemctl stop tg-tor-watchdog 2>/dev/null || true
+    systemctl disable tg-tor-watchdog 2>/dev/null || true
+
+    # Остановить основные сервисы прокси
+    for svc in tg-tor-proxy tg-tor-bootstrap; do
+        systemctl stop "$svc" 2>/dev/null || true
+        systemctl disable "$svc" 2>/dev/null || true
+    done
+
+    # Остановить Tor + Redsocks (multi или single)
+    if [ "$tor_count" -gt 1 ]; then
+        for ((i=0; i<tor_count; i++)); do
+            systemctl stop "tg-tor-inst${i}" 2>/dev/null || true
+            systemctl disable "tg-tor-inst${i}" 2>/dev/null || true
+            systemctl stop "redsocks-inst${i}" 2>/dev/null || true
+            systemctl disable "redsocks-inst${i}" 2>/dev/null || true
+        done
+    else
+        systemctl stop tor@default 2>/dev/null || systemctl stop tor 2>/dev/null || true
+        systemctl disable tor@default 2>/dev/null || true
+        systemctl stop redsocks 2>/dev/null || true
+        systemctl disable redsocks 2>/dev/null || true
+    fi
+
+    # Снять iptables правила и сохранить (persist "off")
+    if [ -x "$ROUTES_SCRIPT" ]; then
+        bash "$ROUTES_SCRIPT" stop 2>/dev/null || true
+    else
+        iptables_cmd -t nat -F TELEGRAM_TOR 2>/dev/null || true
+        iptables_cmd -t nat -D PREROUTING -j TELEGRAM_TOR 2>/dev/null || true
+        iptables_cmd -t nat -X TELEGRAM_TOR 2>/dev/null || true
+    fi
+    save_iptables_rules
+    log "iptables правила сняты"
+
+    # Записать флаг disabled в конфиг
+    if grep -q '^disabled=' "$CONFIG_FILE" 2>/dev/null; then
+        sed -i 's/^disabled=.*/disabled=1/' "$CONFIG_FILE"
+    else
+        echo "disabled=1" >> "$CONFIG_FILE"
+    fi
+
+    log "tg-tor-proxy отключён. Telegram идёт напрямую (без Tor)."
+    info "Для включения: tg-tor-proxy --enable"
+}
+
+cmd_enable() {
+    require_root
+    [ -f "$CONFIG_FILE" ] || die "tg-tor-proxy не установлен. Сначала выполните установку (пункт 1)."
+    if ! is_disabled; then
+        warn "Приложение уже включено."
+        return 0
+    fi
+
+    hdr "Включение tg-tor-proxy"
+
+    local tor_count
+    tor_count=$(get_tor_instances)
+
+    # Запустить Tor + Redsocks
+    if [ "$tor_count" -gt 1 ]; then
+        for ((i=0; i<tor_count; i++)); do
+            systemctl enable "tg-tor-inst${i}" 2>/dev/null || true
+            systemctl start "tg-tor-inst${i}" 2>/dev/null || true
+            systemctl enable "redsocks-inst${i}" 2>/dev/null || true
+            systemctl start "redsocks-inst${i}" 2>/dev/null || true
+        done
+    else
+        systemctl enable tor@default 2>/dev/null || true
+        systemctl start tor@default 2>/dev/null || systemctl start tor 2>/dev/null || true
+        systemctl enable redsocks 2>/dev/null || true
+        systemctl start redsocks 2>/dev/null || true
+    fi
+
+    # Запустить основные сервисы
+    for svc in tg-tor-bootstrap tg-tor-proxy tg-tor-watchdog; do
+        systemctl enable "$svc" 2>/dev/null || true
+        systemctl start "$svc" 2>/dev/null || true
+    done
+
+    # Применить iptables правила
+    if [ -x "$ROUTES_SCRIPT" ]; then
+        bash "$ROUTES_SCRIPT" start
+        apply_redsocks_protection
+        save_iptables_rules
+        log "iptables правила применены"
+    else
+        warn "Скрипт правил не найден — запустите установку (пункт 1)"
+    fi
+
+    # Снять флаг disabled
+    sed -i '/^disabled=/d' "$CONFIG_FILE"
+
+    log "tg-tor-proxy включён. Telegram идёт через Tor."
+    info "Проверьте статус: tg-tor-proxy --diagnose"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DIAGNOSTICS
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_diagnose() {
@@ -2038,7 +2158,13 @@ show_menu() {
 
     local inst_label=""
     [ "$tor_count" -gt 1 ] && inst_label=" ×${tor_count}"
-    echo -e "  Tor ${tor_icon} ${tor_pct}%${inst_label} (${mode})   Redsocks ${redsocks_icon}   iptables ${rules_icon}"
+
+    # Показать статус disabled если нужно
+    if is_disabled; then
+        echo -e "  ${YELLOW}⏸  ПРИЛОЖЕНИЕ ОТКЛЮЧЕНО${NC}  (Telegram идёт напрямую)"
+    else
+        echo -e "  Tor ${tor_icon} ${tor_pct}%${inst_label} (${mode})   Redsocks ${redsocks_icon}   iptables ${rules_icon}"
+    fi
     echo ""
     echo -e "${BOLD}  Выберите действие:${NC}"
     echo ""
@@ -2050,6 +2176,11 @@ show_menu() {
     echo -e "  ${CYAN}6)${NC}  Применить iptables правила (если слетели)"
     echo -e "  ${CYAN}7)${NC}  Показать активные Telegram-сессии (live)"
     echo -e "  ${CYAN}9)${NC}  Проверить и установить обновление"
+    if is_disabled; then
+        echo -e "  ${GREEN}d)${NC}  Включить (восстановить маршрутизацию через Tor)"
+    else
+        echo -e "  ${YELLOW}d)${NC}  Отключить (остановить без удаления)"
+    fi
     echo -e "  ${RED}8)${NC}  Удалить всё (deinstall)"
     echo -e "  ${CYAN}0)${NC}  Выход"
     echo ""
@@ -2060,7 +2191,7 @@ interactive_menu() {
 
     while true; do
         show_menu
-        read -rp "  Ваш выбор [0-9]: " choice
+        read -rp "  Ваш выбор [0-9/d]: " choice
         echo ""
 
         case "$choice" in
@@ -2149,6 +2280,15 @@ interactive_menu() {
                 ;;
             9)
                 cmd_update
+                echo ""
+                read -rp "  Нажмите Enter для возврата в меню..." _dummy
+                ;;
+            d|D)
+                if is_disabled; then
+                    cmd_enable
+                else
+                    cmd_disable
+                fi
                 echo ""
                 read -rp "  Нажмите Enter для возврата в меню..." _dummy
                 ;;
@@ -2299,6 +2439,12 @@ main() {
         --remove|--uninstall|-r)
             require_root; cmd_remove
             ;;
+        --disable)
+            require_root; cmd_disable
+            ;;
+        --enable)
+            require_root; cmd_enable
+            ;;
         --diagnose|--status|-d|-s)
             require_root; cmd_diagnose
             ;;
@@ -2332,6 +2478,8 @@ ${BOLD}tg-tor-proxy v${VERSION}${NC} — Telegram через Tor для VPN-кл
 ${BOLD}Прямые команды (для автоматизации):${NC}
   --install                     Установить / настроить
   --remove                      Удалить всё
+  --disable                     Остановить сервисы, снять правила (конфиг сохраняется)
+  --enable                      Включить обратно после --disable
   --diagnose                    Диагностический отчёт
   --check-tor                   Проверить Tor
   --add-bridges [СТРОКА]        Добавить мосты (интерактивно или строкой)
