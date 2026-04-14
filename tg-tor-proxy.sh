@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 # tg-tor-proxy.sh — Route Telegram through Tor for AmneziaWG / Xray VPN clients
-# Version: 2.3.1
+# Version: 2.3.2
 # =============================================================================
 # Usage:
 #   ./tg-tor-proxy.sh                    — install / reconfigure
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
-readonly VERSION="2.3.1"
+readonly VERSION="2.3.2"
 readonly SCRIPT_NAME="tg-tor-proxy"
 readonly CONFIG_DIR="/etc/tg-tor-proxy"
 readonly CONFIG_FILE="$CONFIG_DIR/config"
@@ -1528,42 +1528,63 @@ cmd_diagnose() {
         echo -e "  Mode: ${BOLD}${mode_line}${NC}   Инстансов: ${BOLD}${tor_instances}${NC}"
     fi
 
+    # Собираем bootstrap % для всех инстансов
+    local -a inst_pct=()
     if [ "$tor_instances" -gt 1 ]; then
         local all_ready=true
         for ((i=0; i<tor_instances; i++)); do
-            local ipct
-            ipct=$(tor_bootstrap_pct_inst "$i" 2>/dev/null || echo "0")
+            inst_pct[$i]=$(tor_bootstrap_pct_inst "$i" 2>/dev/null || echo "0")
             local color="${GREEN}"
-            [ "$ipct" != "100" ] && color="${YELLOW}" && all_ready=false
-            echo -e "  inst${i} bootstrap: ${color}${BOLD}${ipct}%${NC}  (SOCKS :${TOR_PORTS[$i]}, redsocks :${RS_PORTS[$i]})"
+            [ "${inst_pct[$i]}" != "100" ] && color="${YELLOW}" && all_ready=false
+            echo -e "  inst${i} bootstrap: ${color}${BOLD}${inst_pct[$i]}%${NC}  (SOCKS :${TOR_PORTS[$i]}, redsocks :${RS_PORTS[$i]})"
         done
         pct=$(tor_bootstrap_pct_inst 0 2>/dev/null || echo "0")
-        if $all_ready; then
-            # Показываем exit IP для каждого инстанса
-            for ((i=0; i<tor_instances; i++)); do
-                local tor_ip
-                tor_ip=$(curl -s --connect-timeout 10 \
-                    --socks5-hostname "127.0.0.1:${TOR_PORTS[$i]}" \
-                    https://check.torproject.org/api/ip 2>/dev/null \
-                    | grep -oP '"IP":"\K[^"]+' || echo "недоступен")
-                echo -e "  Tor exit IP (inst${i}): ${BOLD}${tor_ip}${NC}"
-            done
-        fi
     else
         pct=$(tor_bootstrap_pct 2>/dev/null || echo "N/A")
         echo -e "  Bootstrap: ${BOLD}${pct}%${NC}"
-
-        if [ "$pct" = "100" ]; then
-            local tor_ip
-            tor_ip=$(curl -s --connect-timeout 10 \
-                --socks5-hostname "127.0.0.1:$TOR_PORT" \
-                https://check.torproject.org/api/ip 2>/dev/null \
-                | grep -oP '"IP":"\K[^"]+' || echo "test failed")
-            echo -e "  Tor exit IP: ${BOLD}$tor_ip${NC}"
-        else
+        [ "$pct" != "100" ] && {
             echo -e "  ${YELLOW}Tor not fully bootstrapped${NC}"
             journalctl -u tor@default --no-pager -n 5 2>/dev/null | grep -E 'Bootstrap|warn|err' | \
                 sed 's/^/  /' || true
+        }
+    fi
+
+    # Запускаем exit IP проверки параллельно (один раз — используется и здесь, и в Connectivity Tests)
+    local -a _ip_tmp=() _ip_pid=()
+    local _ip_ready=false
+    if [ "$tor_instances" -gt 1 ] && ${all_ready:-false}; then
+        _ip_ready=true
+        for ((i=0; i<tor_instances; i++)); do
+            _ip_tmp[$i]=$(mktemp)
+            curl -s --connect-timeout 5 --max-time 8 \
+                --socks5-hostname "127.0.0.1:${TOR_PORTS[$i]}" \
+                "https://check.torproject.org/api/ip" > "${_ip_tmp[$i]}" 2>/dev/null &
+            _ip_pid[$i]=$!
+        done
+    elif [ "$tor_instances" -eq 1 ] && [ "$pct" = "100" ]; then
+        _ip_ready=true
+        _ip_tmp[0]=$(mktemp)
+        curl -s --connect-timeout 5 --max-time 8 \
+            --socks5-hostname "127.0.0.1:$TOR_PORT" \
+            "https://check.torproject.org/api/ip" > "${_ip_tmp[0]}" 2>/dev/null &
+        _ip_pid[0]=$!
+    fi
+
+    # Ждём все curl и показываем exit IP в Tor Status
+    local -a _exit_ip=()
+    if $_ip_ready; then
+        for i in "${!_ip_pid[@]}"; do
+            wait "${_ip_pid[$i]}" 2>/dev/null || true
+            _exit_ip[$i]=$(grep -oP '"IP":"\K[^"]+' "${_ip_tmp[$i]}" 2>/dev/null || echo "")
+            rm -f "${_ip_tmp[$i]}"
+        done
+        if [ "$tor_instances" -gt 1 ]; then
+            for ((i=0; i<tor_instances; i++)); do
+                local disp="${_exit_ip[$i]:-недоступен}"
+                echo -e "  Tor exit IP (inst${i}): ${BOLD}${disp}${NC}"
+            done
+        else
+            echo -e "  Tor exit IP: ${BOLD}${_exit_ip[0]:-test failed}${NC}"
         fi
     fi
 
@@ -1648,32 +1669,23 @@ cmd_diagnose() {
     # ── Live connectivity test ────────────────────────────────────────────
     hdr "Connectivity Tests"
 
-    # Tor SOCKS5 check — каждый инстанс отдельно
+    # Tor SOCKS5 check — используем exit IP, уже собранные параллельно выше
     if [ "$tor_instances" -gt 1 ]; then
         for ((i=0; i<tor_instances; i++)); do
-            local ipct_c tor_ip_c
-            ipct_c=$(tor_bootstrap_pct_inst "$i" 2>/dev/null || echo "0")
-            if [ "$ipct_c" = "100" ]; then
-                tor_ip_c=$(curl -s --connect-timeout 10 \
-                    --socks5-hostname "127.0.0.1:${TOR_PORTS[$i]}" \
-                    "https://check.torproject.org/api/ip" 2>/dev/null \
-                    | grep -oP '"IP":"\K[^"]+' || true)
+            if [ "${inst_pct[$i]:-0}" = "100" ]; then
+                local tor_ip_c="${_exit_ip[$i]:-}"
                 if [ -n "$tor_ip_c" ]; then
                     echo -e "  Tor SOCKS5 (inst${i} :${TOR_PORTS[$i]}): ${GREEN}working${NC} (exit IP: ${tor_ip_c})"
                 else
                     echo -e "  Tor SOCKS5 (inst${i} :${TOR_PORTS[$i]}): ${RED}no response${NC}"
                 fi
             else
-                echo -e "  Tor SOCKS5 (inst${i} :${TOR_PORTS[$i]}): ${YELLOW}not ready${NC} (bootstrap: ${ipct_c}%)"
+                echo -e "  Tor SOCKS5 (inst${i} :${TOR_PORTS[$i]}): ${YELLOW}not ready${NC} (bootstrap: ${inst_pct[$i]:-0}%)"
             fi
         done
     else
         if [ "$pct" = "100" ]; then
-            local tor_ip
-            tor_ip=$(curl -s --connect-timeout 15 \
-                --socks5-hostname "127.0.0.1:$TOR_PORT" \
-                "https://check.torproject.org/api/ip" 2>/dev/null \
-                | grep -oP '"IP":"\K[^"]+' || true)
+            local tor_ip="${_exit_ip[0]:-}"
             if [ -n "$tor_ip" ]; then
                 echo -e "  Tor SOCKS5: ${GREEN}working${NC} (exit IP: ${tor_ip})"
             else
